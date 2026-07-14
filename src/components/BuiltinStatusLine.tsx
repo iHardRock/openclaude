@@ -52,6 +52,8 @@ export type BuiltinStatusData = {
   contextInputTokens: number | null;
   /** Model context window size in tokens. */
   contextWindow: number | null;
+  /** When true, token counts are transcript-based estimates (e.g. all-zero provider response). */
+  contextIsEstimated?: boolean;
   costUSD: number;
   /** Worst rate-limit window, or null when no utilization data (API-key users). */
   rateLimit: {
@@ -71,10 +73,14 @@ export function buildBuiltinStatusSegments(data: BuiltinStatusData): StatusSegme
     const usedTokens = data.contextInputTokens;
     const window = data.contextWindow;
     const pctText = pct > 0 && pct < 1 ? '<1' : String(roundedPct);
-    // Token display: "ctx 5K/200K (7%)" — full form
-    const tokenText = `${formatTokenCount(usedTokens)}/${formatTokenCount(window)}`;
+    // Token display: "ctx ~5K/200K (7%)" — full form
+    // The ~ prefix signals that input token counts are transcript-based
+    // estimates (e.g. provider reported all-zero usage), matching the
+    // public custom-statusline contract which exposes is_estimated.
+    const prefix = data.contextIsEstimated ? '~' : '';
+    const tokenText = `${prefix}${formatTokenCount(usedTokens)}/${formatTokenCount(window)}`;
     const text = `ctx ${tokenText} (${pctText}%)`;
-    // Short form drops the percentage for narrow terminals: "ctx 5K/200K"
+    // Short form: "ctx ~5K/200K"
     const shortText = `ctx ${tokenText}`;
     segments.push({
       key: 'context',
@@ -200,6 +206,7 @@ function BuiltinStatusLineInner({
       contextUsedPercent: contextPercentages.used,
       contextInputTokens: inputTokens,
       contextWindow: contextWindowSize,
+      contextIsEstimated: currentUsage?.is_estimated,
       costUSD: getTotalCost()
     };
     // messagesRef is stable; lastAssistantMessageId is the messages-changed signal

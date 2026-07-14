@@ -105,6 +105,34 @@ describe('buildBuiltinStatusSegments', () => {
     expect(at(60)).toBe('warning')
     expect(at(85)).toBe('error')
   })
+
+  it('prefixes estimated tokens with ~ when contextIsEstimated is true', () => {
+    const ctx = buildBuiltinStatusSegments({
+      ...fullData,
+      contextUsedPercent: 37,
+      contextInputTokens: 74000,
+      contextWindow: 200000,
+      contextIsEstimated: true,
+    }).find(s => s.key === 'context')
+
+    expect(ctx?.text).toBe('ctx ~74K/200K (37%)')
+    expect(ctx?.shortText).toBe('ctx ~74K/200K')
+  })
+
+  it('does not show ~ when contextIsEstimated is false or absent', () => {
+    const ctxWithFlag = buildBuiltinStatusSegments({
+      ...fullData,
+      contextIsEstimated: false,
+    }).find(s => s.key === 'context')
+    const ctxWithoutFlag = buildBuiltinStatusSegments({
+      ...fullData,
+    }).find(s => s.key === 'context')
+
+    expect(ctxWithFlag?.text).toBe('ctx 74K/200K (37%)')
+    expect(ctxWithFlag?.shortText).toBe('ctx 74K/200K')
+    expect(ctxWithoutFlag?.text).toBe('ctx 74K/200K (37%)')
+    expect(ctxWithoutFlag?.shortText).toBe('ctx 74K/200K')
+  })
 })
 
 describe('fitSegments', () => {
