@@ -76,11 +76,31 @@ export type ProviderProfileInput = {
   authHeaderValue?: ProviderProfile['authHeaderValue']
   customHeaders?: ProviderProfile['customHeaders']
   maxContextLength?: ProviderProfile['maxContextLength']
+  selfHostedTools?: boolean
 }
 
 export type ProviderPresetDefaults = Omit<ProviderProfileInput, 'provider'> & {
   provider: ProviderProfile['provider']
   requiresApiKey: boolean
+  selfHostedTools?: boolean
+}
+
+/** OpenAI-compatible profiles can toggle per-profile self-hosted tool compat. */
+export function providerProfileSupportsSelfHostedTools(
+  provider: string,
+): boolean {
+  return resolveProfileCompatibility(provider).compatibilityMode === 'openai'
+}
+
+/** Attach OPENAI_SELF_HOSTED_TOOLS when the profile opts in. */
+export function applySelfHostedToolsProfileEnv(
+  env: ProfileEnv,
+  selfHostedTools?: boolean,
+): ProfileEnv {
+  if (!selfHostedTools) {
+    return env
+  }
+  return { ...env, OPENAI_SELF_HOSTED_TOOLS: '1' }
 }
 
 const PROFILE_ENV_APPLIED_FLAG = 'CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED'
@@ -339,6 +359,12 @@ function sanitizeProfile(profile: ProviderProfile): ProviderProfile | null {
   if (maxContextLength !== undefined) {
     sanitized.maxContextLength = maxContextLength
   }
+  if (
+    providerProfileSupportsSelfHostedTools(provider) &&
+    profile.selfHostedTools === true
+  ) {
+    sanitized.selfHostedTools = true
+  }
   return sanitized
 }
 
@@ -379,6 +405,7 @@ function toProfile(
     authHeaderValue: input.authHeaderValue,
     customHeaders: input.customHeaders,
     maxContextLength: input.maxContextLength,
+    selfHostedTools: input.selfHostedTools,
   })
 }
 
@@ -454,6 +481,8 @@ export function getProviderPresetDefaults(
     model: routeDefaults.model,
     apiKey: metadata.apiKey,
     requiresApiKey: metadata.requiresApiKey,
+    // Ollama is always self-hosted; enable tool-text recovery by default.
+    selfHostedTools: preset === 'ollama' ? true : undefined,
   }
 }
 
@@ -884,10 +913,14 @@ export function applyProviderProfileToProcessEnv(
       route.routeId === 'xiaomi-mimo' || route.routeId === 'xiaomi-mimo-token'
         ? normalizeXiaomiMimoBaseUrl(profile.baseUrl) ?? profile.baseUrl
         : profile.baseUrl
-    const openAIProfileEnv: ProfileEnv = {
+    let openAIProfileEnv: ProfileEnv = {
       OPENAI_BASE_URL: normalizedProfileBaseUrl,
       OPENAI_MODEL: primaryModel,
     }
+    openAIProfileEnv = applySelfHostedToolsProfileEnv(
+      openAIProfileEnv,
+      profile.selfHostedTools,
+    )
     const isAimlapiProfile =
       profile.provider === 'aimlapi' ||
       route.routeId === 'aimlapi' ||
@@ -1300,11 +1333,14 @@ function buildOpenAICompatibleStartupEnv(
       if (isCloudflareBaseUrl(activeProfile.baseUrl)) {
         strictEnv.CLOUDFLARE_API_TOKEN = activeProfile.apiKey
       }
-      return applySupportedProfileCustomHeaders(activeProfile, strictEnv)
+      return applySupportedProfileCustomHeaders(
+        activeProfile,
+        applySelfHostedToolsProfileEnv(strictEnv, activeProfile.selfHostedTools),
+      )
     }
   }
 
-  const env: ProfileEnv = {
+  let env: ProfileEnv = {
     OPENAI_BASE_URL: activeProfile.baseUrl,
     OPENAI_MODEL: getPrimaryModel(activeProfile.model),
     ...(activeProfile.apiFormat ? { OPENAI_API_FORMAT: activeProfile.apiFormat } : {}),
@@ -1319,6 +1355,7 @@ function buildOpenAICompatibleStartupEnv(
         }
       : {}),
   }
+  env = applySelfHostedToolsProfileEnv(env, activeProfile.selfHostedTools)
 
   if (isAimlapiProfile) {
     env.CLAUDE_CODE_PROVIDER_ROUTE_ID = 'aimlapi'
