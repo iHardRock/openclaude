@@ -66,6 +66,7 @@ import {
   getActiveProviderProfile,
   getProviderPresetDefaults,
   getProviderProfiles,
+  providerProfileSupportsSelfHostedTools,
   setActiveProviderProfile,
   type ProviderPreset,
   type ProviderProfileInput,
@@ -144,6 +145,7 @@ type DraftField =
   | 'model'
   | 'apiKey'
   | 'apiFormat'
+  | 'selfHostedTools'
   | 'authHeader'
   | 'authHeaderValue'
   | 'customHeaders'
@@ -194,6 +196,14 @@ const FORM_STEPS: Array<{
     label: 'Default model',
     placeholder: 'e.g. llama3.1:8b or glm-4.7; glm-4.7-flash',
     helpText: 'Model name(s) to use. Separate multiple with ";" or ","; first is default.',
+  },
+  {
+    key: 'selfHostedTools',
+    label: 'Self-hosted tools',
+    placeholder: 'enabled',
+    helpText:
+      'For llama-server / vLLM / Ollama on this profile only. Enables JSON-in-text tool recovery. No shell env. Other providers unchanged.',
+    optional: true,
   },
   {
     key: 'apiFormat',
@@ -251,6 +261,7 @@ function toDraft(profile: ProviderProfile): ProviderDraft {
     model: profile.model,
     apiKey: profile.apiKey ?? '',
     apiFormat: profile.apiFormat ?? 'chat_completions',
+    selfHostedTools: profile.selfHostedTools ? 'enabled' : 'disabled',
     authHeader: profile.authHeader ?? '',
     authHeaderValue: profile.authHeaderValue ?? '',
     customHeaders: serializeProfileCustomHeaders(profile.customHeaders) ?? '',
@@ -286,6 +297,7 @@ function presetToDraft(preset: ProviderPreset): ProviderDraft {
     model: defaults.model,
     apiKey: defaults.apiKey ?? '',
     apiFormat: 'chat_completions',
+    selfHostedTools: defaults.selfHostedTools ? 'enabled' : 'disabled',
     authHeader: '',
     authHeaderValue: '',
     customHeaders: '',
@@ -316,11 +328,16 @@ function profileSummary(profile: ProviderProfile, isActive: boolean): string {
     routeSupportsApiFormatSelection(routeId)
       ? ` · ${profile.apiFormat === 'responses_compat' ? 'responses (compat)' : profile.apiFormat === 'responses' ? 'responses' : 'chat/completions'}`
       : ''
+  const selfHostedInfo =
+    providerProfileSupportsSelfHostedTools(profile.provider) &&
+    profile.selfHostedTools
+      ? ' · self-hosted tools'
+      : ''
   const authInfo =
     routeSupportsAuthHeaders(routeId) && profile.authHeader
       ? ` · ${profile.authHeader} auth`
       : ''
-  return `${providerKind} · ${profile.baseUrl} · ${modelDisplay}${modeInfo}${authInfo} · ${keyInfo}${activeSuffix}`
+  return `${providerKind} · ${profile.baseUrl} · ${modelDisplay}${modeInfo}${selfHostedInfo}${authInfo} · ${keyInfo}${activeSuffix}`
 }
 
 function getGithubCredentialSourceFromEnv(
@@ -885,6 +902,9 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
       const showsAuthHeaderValue = routeShowsAuthHeaderValue(routeId)
       const showsCustomHeaders = routeShowsCustomHeaders(routeId)
       return FORM_STEPS.filter(step => {
+        if (step.key === 'selfHostedTools') {
+          return providerProfileSupportsSelfHostedTools(draftProvider)
+        }
         if (step.key === 'apiFormat') {
           return routeSupportsApiFormatSelection(routeId)
         }
@@ -1561,16 +1581,8 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
   function startCreateFromPreset(preset: ProviderPreset): void {
     const defaults = getProviderPresetDefaults(preset)
     const provider = defaults.provider ?? 'openai'
-    const nextDraft = {
-      name: defaults.name,
-      baseUrl: defaults.baseUrl,
-      model: defaults.model,
-      apiKey: defaults.apiKey ?? '',
-      apiFormat: 'chat_completions',
-      authHeader: '',
-      authHeaderValue: '',
-      customHeaders: '',
-    }
+    const nextDraft = presetToDraft(preset)
+    nextDraft.apiKey = defaults.apiKey ?? ''
     setEditingProfileId(null)
     setDraftProvider(provider)
     setDraft(nextDraft)
@@ -1671,6 +1683,11 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         showsCustomHeaders &&
         Object.keys(parsedCustomHeaders.headers).length > 0
           ? parsedCustomHeaders.headers
+          : undefined,
+      selfHostedTools:
+        providerProfileSupportsSelfHostedTools(provider) &&
+        nextDraft.selfHostedTools === 'enabled'
+          ? true
           : undefined,
     }
 
@@ -2173,7 +2190,29 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
         <Text dimColor>
           Step {formStepIndex + 1} of {formSteps.length}: {currentStep.label}
         </Text>
-        {currentStepKey === 'apiFormat' ? (
+        {currentStepKey === 'selfHostedTools' ? (
+          <Select
+            options={[
+              {
+                value: 'disabled',
+                label: 'Disabled',
+                description:
+                  'Cloud-style: structured API tool_calls only (OpenAI, OpenRouter, …)',
+              },
+              {
+                value: 'enabled',
+                label: 'Enabled',
+                description:
+                  'Self-hosted for this profile: JSON-in-text tools (llama-server, vLLM, Ollama)',
+              },
+            ]}
+            defaultValue={currentValue === 'enabled' ? 'enabled' : 'disabled'}
+            defaultFocusValue={currentValue === 'enabled' ? 'enabled' : 'disabled'}
+            onChange={(value: string) => handleFormSubmit(value)}
+            onCancel={handleBackFromForm}
+            visibleOptionCount={2}
+          />
+        ) : currentStepKey === 'apiFormat' ? (
           <Select
             options={[
               {
