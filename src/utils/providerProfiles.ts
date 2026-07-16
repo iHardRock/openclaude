@@ -232,12 +232,15 @@ function resolveProfileCapabilityRouteId(
   provider: string,
   baseUrl?: string,
 ): string {
+  const providerRouteId = resolveProfileRoute(provider).routeId
+  if (providerRouteId === 'custom-anthropic') {
+    return providerRouteId
+  }
+
   const routeIdFromBaseUrl = resolveRouteIdFromBaseUrl(baseUrl)
   if (routeIdFromBaseUrl) {
     return routeIdFromBaseUrl
   }
-
-  const providerRouteId = resolveProfileRoute(provider).routeId
 
   // A cloudflare profile retargeted away from the real Workers AI endpoint
   // (e.g. to gateway.ai.cloudflare.com or another OpenAI-compatible host) is
@@ -432,6 +435,16 @@ function applySupportedProfileCustomHeaders(
   return customHeaders ? { ...env, ANTHROPIC_CUSTOM_HEADERS: customHeaders } : env
 }
 
+function buildAnthropicCredentialEnv(
+  provider: ProviderProfile['provider'],
+  apiKey: string | undefined,
+): ProfileEnv {
+  if (!apiKey) return {}
+  return provider === 'custom-anthropic'
+    ? { ANTHROPIC_AUTH_TOKEN: apiKey }
+    : { ANTHROPIC_API_KEY: apiKey }
+}
+
 function getModelCacheByProfile(
   profileId: string,
   config = getGlobalConfig(),
@@ -471,7 +484,7 @@ export function getProviderPresetDefaults(
   // Keep preset-pinned endpoints/models even when generic OpenAI env values
   // are present, but still read provider-specific credential env vars above.
   const routeDefaults =
-    preset === 'custom'
+    preset === 'custom' || preset === 'custom-anthropic'
       ? metadata
       : getProviderPresetUiMetadata(preset, {})
   return {
@@ -479,7 +492,13 @@ export function getProviderPresetDefaults(
     name: metadata.name,
     baseUrl: routeDefaults.baseUrl,
     model: routeDefaults.model,
-    apiKey: metadata.apiKey,
+    // The /provider custom Anthropic flow always saves a Bearer token. Keep
+    // direct ANTHROPIC_API_KEY/x-api-key setups out of that field so opening
+    // the preset cannot silently change their authentication scheme.
+    apiKey:
+      preset === 'custom-anthropic'
+        ? process.env.ANTHROPIC_AUTH_TOKEN?.trim() || undefined
+        : metadata.apiKey,
     requiresApiKey: metadata.requiresApiKey,
     // Ollama is always self-hosted; enable tool-text recovery by default.
     selfHostedTools: preset === 'ollama' ? true : undefined,
@@ -528,6 +547,14 @@ function hasCompleteProviderSelection(
   processEnv: NodeJS.ProcessEnv = process.env,
 ): boolean {
   if (resolveEnvOnlyProviderRouteId(processEnv) !== null) return true
+  if (
+    trimOrUndefined(processEnv.ANTHROPIC_BASE_URL) !== undefined &&
+    trimOrUndefined(processEnv.ANTHROPIC_MODEL) !== undefined &&
+    (trimOrUndefined(processEnv.ANTHROPIC_AUTH_TOKEN) !== undefined ||
+      trimOrUndefined(processEnv.ANTHROPIC_API_KEY) !== undefined)
+  ) {
+    return true
+  }
   if (!hasProviderSelectionFlags(processEnv)) return false
   if (processEnv.CLAUDE_CODE_USE_OPENAI !== undefined) {
     return (
@@ -620,7 +647,9 @@ function isProcessEnvAlignedWithProfile(
       sameOptionalEnvValue(processEnv.ANTHROPIC_BASE_URL, profile.baseUrl) &&
       sameOptionalEnvValue(processEnv.ANTHROPIC_MODEL, primaryModel) &&
       (!includeApiKey ||
-        sameOptionalEnvValue(processEnv.ANTHROPIC_API_KEY, profile.apiKey))
+        (profile.provider === 'custom-anthropic'
+          ? sameOptionalEnvValue(processEnv.ANTHROPIC_AUTH_TOKEN, profile.apiKey)
+          : sameOptionalEnvValue(processEnv.ANTHROPIC_API_KEY, profile.apiKey)))
     )
   }
 
@@ -867,7 +896,7 @@ export function applyProviderProfileToProcessEnv(
       profileEnv = {
         ANTHROPIC_BASE_URL: profile.baseUrl,
         ANTHROPIC_MODEL: primaryModel,
-        ...(profile.apiKey ? { ANTHROPIC_API_KEY: profile.apiKey } : {}),
+        ...buildAnthropicCredentialEnv(profile.provider, profile.apiKey),
       }
     }
   } else if (compatibilityMode === 'mistral') {
@@ -1218,7 +1247,7 @@ export function updateProviderProfile(
   }
 
   if (shouldApply) {
-    applyProviderProfileToProcessEnv(updatedProfile)
+    setActiveProviderProfile(profileId)
   }
 
   return updatedProfile
@@ -1435,9 +1464,10 @@ function buildStartupProfileFromActiveProfile(
         env: applySupportedProfileCustomHeaders(activeProfile, {
           ANTHROPIC_BASE_URL: activeProfile.baseUrl,
           ANTHROPIC_MODEL: getPrimaryModel(activeProfile.model),
-          ...(activeProfile.apiKey
-            ? { ANTHROPIC_API_KEY: activeProfile.apiKey }
-            : {}),
+          ...buildAnthropicCredentialEnv(
+            activeProfile.provider,
+            activeProfile.apiKey,
+          ),
         }),
       }
     case 'gemini': {
@@ -1663,6 +1693,7 @@ export function deleteProviderProfile(profileId: string): {
   let removed = false
   let deletedProfile: ProviderProfile | undefined
   let nextActiveProfile: ProviderProfile | undefined
+  let activeProfileWasDeleted = false
 
   saveGlobalConfig(current => {
     const currentProfiles = getProviderProfiles(current)
@@ -1685,6 +1716,7 @@ export function deleteProviderProfile(profileId: string): {
       currentActive === profileId ||
       (currentActive !== ANTHROPIC_DEFAULT_PROFILE_ID &&
         !nextProfiles.some(profile => profile.id === currentActive))
+    activeProfileWasDeleted = activeWasDeleted
 
     const nextActiveId = activeWasDeleted ? nextProfiles[0]?.id : currentActive
 
@@ -1719,14 +1751,16 @@ export function deleteProviderProfile(profileId: string): {
   })
 
   if (nextActiveProfile) {
-    applyProviderProfileToProcessEnv(nextActiveProfile)
-  } else if (
-    deletedProfile &&
-    isProcessEnvAlignedWithProfile(process.env, deletedProfile, {
-      includeApiKey: false,
-    })
-  ) {
-    clearProviderProfileEnvFromProcessEnv()
+    setActiveProviderProfile(nextActiveProfile.id)
+  } else if (deletedProfile && activeProfileWasDeleted) {
+    if (
+      isProcessEnvAlignedWithProfile(process.env, deletedProfile, {
+        includeApiKey: false,
+      })
+    ) {
+      clearProviderProfileEnvFromProcessEnv()
+    }
+    deleteProfileFile()
   }
 
   return {
