@@ -2025,15 +2025,22 @@ export async function buildLaunchEnv(options: {
   // drops OPENAI_SELF_HOSTED_TOOLS even when the legacy profile file had it.
   // When the value comes only from the persisted startup profile, mark
   // provenance so later profile activation does not treat it as a shell export.
+  // Prefer shell whenever it is defined (including empty string); only fall
+  // back to persisted when shell is undefined.
   const shellSelfHostedToolsFlag = processEnv.OPENAI_SELF_HOSTED_TOOLS
   const persistedSelfHostedToolsFlag = usePersistedOpenAIConfig
     ? persistedEnv.OPENAI_SELF_HOSTED_TOOLS
     : undefined
   const selfHostedToolsFlag =
-    shellSelfHostedToolsFlag || persistedSelfHostedToolsFlag
-  if (selfHostedToolsFlag) {
+    shellSelfHostedToolsFlag !== undefined
+      ? shellSelfHostedToolsFlag
+      : persistedSelfHostedToolsFlag
+  if (selfHostedToolsFlag !== undefined) {
     env.OPENAI_SELF_HOSTED_TOOLS = selfHostedToolsFlag
-    if (!shellSelfHostedToolsFlag && persistedSelfHostedToolsFlag) {
+    if (
+      shellSelfHostedToolsFlag === undefined &&
+      persistedSelfHostedToolsFlag !== undefined
+    ) {
       env.OPENCLAUDE_STARTUP_SELF_HOSTED_TOOLS = '1'
     }
   }
@@ -2042,10 +2049,15 @@ export async function buildLaunchEnv(options: {
     ? persistedEnv.OPENAI_PARSE_TEXT_TOOL_CALLS
     : undefined
   const parseTextToolCallsFlag =
-    shellParseTextToolCallsFlag || persistedParseTextToolCallsFlag
-  if (parseTextToolCallsFlag) {
+    shellParseTextToolCallsFlag !== undefined
+      ? shellParseTextToolCallsFlag
+      : persistedParseTextToolCallsFlag
+  if (parseTextToolCallsFlag !== undefined) {
     env.OPENAI_PARSE_TEXT_TOOL_CALLS = parseTextToolCallsFlag
-    if (!shellParseTextToolCallsFlag && persistedParseTextToolCallsFlag) {
+    if (
+      shellParseTextToolCallsFlag === undefined &&
+      persistedParseTextToolCallsFlag !== undefined
+    ) {
       env.OPENCLAUDE_STARTUP_PARSE_TEXT_TOOL_CALLS = '1'
     }
   }
