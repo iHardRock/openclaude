@@ -2493,22 +2493,31 @@ function findXmlToolCallOpener(text: string, allowHy3: boolean): number {
 /** Exported for unit testing only. */
 export function parseXmlToolCalls(text: string, allowHy3 = false): {
   calls: ParsedTextToolCall[]
+  /** 1:1 with `calls` (unique tool invocations only). */
   toolCallRanges: Array<[number, number]>
+  /**
+   * Every matching XML block range, including duplicates of the same call.
+   * Use for stripRanges so repeated identical tool XML does not remain visible.
+   */
+  stripToolCallRanges: Array<[number, number]>
 } {
   const results: ParsedTextToolCall[] = []
   const seen = new Set<string>()
   const ranges: Array<[number, number]> = []
+  const stripRangesAll: Array<[number, number]> = []
 
   const addCall = (
     name: string,
     args: Record<string, unknown>,
     range: [number, number],
   ): boolean => {
+    // Always retain the block for stripping, even when the call is deduped.
+    stripRangesAll.push(range)
     const dedupKey = `${name}:${JSON.stringify(args)}`
     if (seen.has(dedupKey)) return false
     seen.add(dedupKey)
     results.push({ id: `xml_tc_${++_textToolCallCounter}`, name, arguments: args })
-    // Keep toolCallRanges 1:1 with calls (skip range for deduped blocks).
+    // Keep toolCallRanges 1:1 with emitted (unique) calls.
     ranges.push(range)
     return true
   }
@@ -2604,7 +2613,11 @@ export function parseXmlToolCalls(text: string, allowHy3 = false): {
     addCall(name, args, range)
   }
 
-  return { calls: results, toolCallRanges: ranges }
+  return {
+    calls: results,
+    toolCallRanges: ranges,
+    stripToolCallRanges: stripRangesAll,
+  }
 }
 
 /**
@@ -2966,12 +2979,12 @@ function convertNonStreamingResponseToAnthropicMessage(
   const appendTextOrRecoveredToolCalls = (rawText: string) => {
     const strippedContent = stripThinkTags(rawText)
     if (!hasStructuredToolCalls) {
-      const { calls: xmlToolCalls, toolCallRanges } = parseXmlToolCalls(
-        strippedContent,
-        isHy3Model(model),
-      )
+      const {
+        calls: xmlToolCalls,
+        stripToolCallRanges: xmlStripRanges,
+      } = parseXmlToolCalls(strippedContent, isHy3Model(model))
       if (xmlToolCalls.length > 0) {
-        const visibleText = stripRanges(strippedContent, toolCallRanges).trim()
+        const visibleText = stripRanges(strippedContent, xmlStripRanges).trim()
         if (visibleText) content.push({ type: 'text', text: visibleText })
         for (const toolCall of xmlToolCalls) {
           content.push({
@@ -3729,7 +3742,8 @@ async function* openaiStreamToAnthropic(
                 accumulatedText,
                 allowHy3ToolCalls,
               )
-              // Pair each call with its range; drop names not in the allowlist.
+              // Drop names not in the allowlist; strip every matching block
+              // (including duplicates) via stripToolCallRanges.
               const allow =
                 allowedToolNames instanceof Set
                   ? allowedToolNames
@@ -3737,10 +3751,8 @@ async function* openaiStreamToAnthropic(
                     ? new Set(allowedToolNames)
                     : undefined
               const filteredCalls: typeof recoveredCalls = []
-              const filteredRanges: Array<[number, number]> = []
               for (let i = 0; i < xmlParsed.calls.length; i++) {
                 const call = xmlParsed.calls[i]!
-                const range = xmlParsed.toolCallRanges[i]
                 if (
                   allow &&
                   allow.size > 0 &&
@@ -3749,12 +3761,12 @@ async function* openaiStreamToAnthropic(
                   continue
                 }
                 filteredCalls.push(call)
-                // toolCallRanges is populated 1:1 with calls by parseXmlToolCalls.
-                filteredRanges.push(range!)
               }
               if (filteredCalls.length > 0) {
                 recoveredCalls = filteredCalls
-                recoveredRanges = filteredRanges
+                // When allowlist is active, still strip all recognized XML
+                // blocks so duplicate copies of accepted tools vanish from text.
+                recoveredRanges = xmlParsed.stripToolCallRanges
               }
             }
             if (recoveredCalls.length > 0) {
@@ -3849,12 +3861,12 @@ async function* openaiStreamToAnthropic(
           if (!isOllamaStream && xmlToolCallText !== null) {
             const buffered = xmlToolCallText
             xmlToolCallText = null
-            const { calls, toolCallRanges } = parseXmlToolCalls(
+            const { calls, stripToolCallRanges } = parseXmlToolCalls(
               buffered,
               allowHy3ToolCalls,
             )
             if (calls.length > 0) {
-              const stripped = stripRanges(buffered, toolCallRanges).trim()
+              const stripped = stripRanges(buffered, stripToolCallRanges).trim()
               const strippedVisible = stripThinkTags(stripped).trim()
               if (strippedVisible) {
                 // emitTextDelta opens a text block if one is not already open;
