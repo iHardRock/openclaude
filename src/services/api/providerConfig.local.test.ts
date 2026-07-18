@@ -120,6 +120,15 @@ test('semantic tool-result boundary is Mistral-only', () => {
     }),
   ).toBe(true)
 
+  // Substring must not match — only hostname mistral.ai / *.mistral.ai
+  expect(
+    shouldInjectToolResultSemanticBoundary({
+      baseUrl: 'https://mistral.ai-proxy.example/v1',
+      model: 'qwen3.6:35b',
+      processEnv: {},
+    }),
+  ).toBe(false)
+
   expect(
     shouldInjectToolResultSemanticBoundary({
       baseUrl: 'http://localhost:8080/v1',

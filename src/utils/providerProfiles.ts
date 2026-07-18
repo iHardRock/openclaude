@@ -880,6 +880,11 @@ export function applyProviderProfileToProcessEnv(
   profile: ProviderProfile,
   options?: { primaryModel?: string },
 ): void {
+  // Capture documented shell overrides before PROFILE_ENV_KEYS are cleared.
+  // Shell wins over profile.selfHostedTools=false for reverse-proxied hosts.
+  const shellSelfHostedTools = process.env.OPENAI_SELF_HOSTED_TOOLS
+  const shellParseTextToolCalls = process.env.OPENAI_PARSE_TEXT_TOOL_CALLS
+
   const { route, compatibilityMode } = resolveProfileCompatibility(profile.provider)
   const primaryModel = options?.primaryModel ?? getPrimaryModel(profile.model)
   let profileEnv: ProfileEnv
@@ -1069,6 +1074,13 @@ export function applyProviderProfileToProcessEnv(
 
   clearProviderProfileEnvFromProcessEnv()
   Object.assign(process.env, nextEnv)
+  // Re-apply explicit shell overrides after managed clear (shell wins).
+  if (shellSelfHostedTools) {
+    process.env.OPENAI_SELF_HOSTED_TOOLS = shellSelfHostedTools
+  }
+  if (shellParseTextToolCalls) {
+    process.env.OPENAI_PARSE_TEXT_TOOL_CALLS = shellParseTextToolCalls
+  }
   process.env[PROFILE_ENV_APPLIED_FLAG] = '1'
   process.env[PROFILE_ENV_APPLIED_ID] = profile.id
 }

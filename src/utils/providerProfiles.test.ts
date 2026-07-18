@@ -356,6 +356,26 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(process.env.OPENAI_SELF_HOSTED_TOOLS).toBeUndefined()
   })
 
+  test('shell OPENAI_SELF_HOSTED_TOOLS survives profile activation without UI flag', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    process.env.OPENAI_SELF_HOSTED_TOOLS = '1'
+    process.env.OPENAI_PARSE_TEXT_TOOL_CALLS = '1'
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        selfHostedTools: false,
+        baseUrl: 'https://llama.example.com:8443/v1',
+        model: 'qwen3.6:35b',
+      }),
+    )
+
+    expect(process.env.OPENAI_SELF_HOSTED_TOOLS).toBe('1')
+    expect(process.env.OPENAI_PARSE_TEXT_TOOL_CALLS).toBe('1')
+    expect(process.env.OPENAI_BASE_URL).toBe('https://llama.example.com:8443/v1')
+  })
+
   test('mistral profile sets CLAUDE_CODE_USE_MISTRAL and clears openai flags', async () => {
     const { applyProviderProfileToProcessEnv } =
       await importFreshProviderProfileModules()

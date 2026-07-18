@@ -1717,6 +1717,7 @@ function parseAndAdd(
   raw: string,
   results: ParsedTextToolCall[],
   seen: Set<string>,
+  allowedToolNames?: ReadonlySet<string>,
 ): boolean {
   let obj: Record<string, unknown>
   try {
@@ -1729,15 +1730,35 @@ function parseAndAdd(
   let args: Record<string, unknown> = {}
 
   if (typeof obj['name'] === 'string') {
-    // {"name": "X", "arguments": {...}}
+    // Require a real tool-call shape: {"name":"X","arguments":...}.
+    // Person records / package.json {"name":"Alice"} must not match.
+    if (!('arguments' in obj)) {
+      return false
+    }
     name = obj['name'] as string
-    args = (obj['arguments'] as Record<string, unknown>) ?? {}
+    const rawArgs = obj['arguments']
+    if (typeof rawArgs === 'string') {
+      try {
+        args = JSON.parse(rawArgs) as Record<string, unknown>
+      } catch {
+        args = {}
+      }
+    } else if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+      args = rawArgs as Record<string, unknown>
+    } else if (rawArgs === undefined || rawArgs === null) {
+      args = {}
+    } else {
+      return false
+    }
   } else if (
     obj['type'] === 'function' &&
-    typeof (obj['function'] as any)?.name === 'string'
+    typeof (obj['function'] as { name?: unknown } | undefined)?.name === 'string'
   ) {
     // {"type":"function","function":{"name":"X","arguments":{...}}}
     const fn = obj['function'] as { name: string; arguments?: unknown }
+    if (!('arguments' in fn)) {
+      return false
+    }
     name = fn.name
     const rawArgs = fn.arguments
     args =
@@ -1749,10 +1770,15 @@ function parseAndAdd(
               return {}
             }
           })()
-        : (rawArgs as Record<string, unknown>) ?? {}
+        : rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
+          ? (rawArgs as Record<string, unknown>)
+          : {}
   }
 
   if (!name) return false
+  if (allowedToolNames && allowedToolNames.size > 0 && !allowedToolNames.has(name)) {
+    return false
+  }
 
   const dedupKey = `${name}:${JSON.stringify(args)}`
   if (seen.has(dedupKey)) return false
@@ -1774,11 +1800,37 @@ function stripRanges(text: string, ranges: Array<[number, number]>): string {
   return result + text.slice(pos)
 }
 
+/** Collect advertised tool names from Anthropic-shaped `tools` on shim create. */
+function toolNamesFromShimParams(tools: unknown): Set<string> | undefined {
+  if (!Array.isArray(tools) || tools.length === 0) {
+    return undefined
+  }
+  const names = new Set<string>()
+  for (const tool of tools) {
+    if (
+      tool &&
+      typeof tool === 'object' &&
+      typeof (tool as { name?: unknown }).name === 'string'
+    ) {
+      names.add((tool as { name: string }).name)
+    }
+  }
+  return names.size > 0 ? names : undefined
+}
+
 /** Exported for unit testing only. */
-export function parseTextToolCalls(text: string): {
+export function parseTextToolCalls(
+  text: string,
+  options?: { allowedToolNames?: ReadonlySet<string> | readonly string[] },
+): {
   calls: ParsedTextToolCall[]
   toolCallRanges: Array<[number, number]>
 } {
+  const allowedToolNames = options?.allowedToolNames
+    ? options.allowedToolNames instanceof Set
+      ? options.allowedToolNames
+      : new Set(options.allowedToolNames)
+    : undefined
   const results: ParsedTextToolCall[] = []
   const seen = new Set<string>()
   const fencedRanges: Array<[number, number]> = []
@@ -1798,7 +1850,7 @@ export function parseTextToolCalls(text: string): {
     if (after.length > 0 && !after.startsWith('{')) continue
     const range: [number, number] = [match.index!, match.index! + match[0].length]
     fencedRanges.push(range)
-    if (raw && parseAndAdd(raw, results, seen)) {
+    if (raw && parseAndAdd(raw, results, seen, allowedToolNames)) {
       acceptedRanges.push(range)
     }
   }
@@ -1818,7 +1870,7 @@ export function parseTextToolCalls(text: string): {
       if (after.length > 0 && !after.startsWith('{')) continue
       const range: [number, number] = [start, start + raw.length]
       processedRanges.push(range)
-      if (parseAndAdd(raw, results, seen)) {
+      if (parseAndAdd(raw, results, seen, allowedToolNames)) {
         acceptedRanges.push(range)
       }
     }
@@ -2397,9 +2449,13 @@ type NonStreamingOpenAIResponse = {
 function convertNonStreamingResponseToAnthropicMessage(
   data: NonStreamingOpenAIResponse,
   model: string,
-  options?: { enableTextToolCallFallback?: boolean },
+  options?: {
+    enableTextToolCallFallback?: boolean
+    allowedToolNames?: ReadonlySet<string> | readonly string[]
+  },
 ) {
   const enableTextToolCallFallback = options?.enableTextToolCallFallback === true
+  const allowedToolNames = options?.allowedToolNames
   const choice = data.choices?.[0]
   const content: Array<Record<string, unknown>> = []
   // An empty tool_calls array is still truthy; treat it as "no structured tool
@@ -2444,7 +2500,7 @@ function convertNonStreamingResponseToAnthropicMessage(
       // happens to end with {"name": ...}.
       if (enableTextToolCallFallback) {
         const { calls: textToolCalls, toolCallRanges: textRanges } =
-          parseTextToolCalls(strippedContent)
+          parseTextToolCalls(strippedContent, { allowedToolNames })
         if (textToolCalls.length > 0) {
           const visibleText = stripRanges(strippedContent, textRanges).trim()
           if (visibleText) content.push({ type: 'text', text: visibleText })
@@ -2571,6 +2627,7 @@ async function* openaiStreamToAnthropic(
    */
   isOllama = false,
   requestUrl?: string,
+  allowedToolNames?: ReadonlySet<string> | readonly string[],
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = makeMessageId()
   const allowHy3ToolCalls = isHy3Model(model)
@@ -2652,6 +2709,7 @@ async function* openaiStreamToAnthropic(
     // JSON-in-text recovery (Ollama / self-hosted tools).
     const message = convertNonStreamingResponseToAnthropicMessage(parsed, model, {
       enableTextToolCallFallback: isOllamaStream,
+      allowedToolNames,
     })
 
     yield {
@@ -3161,12 +3219,37 @@ async function* openaiStreamToAnthropic(
           const originalFinishReason = choice.finish_reason
           let ollamaClosedContentBlock = false
           if (isTerminalOllamaFinish) {
-            const { calls: textToolCalls, toolCallRanges } = parseTextToolCalls(accumulatedText)
+            // Prefer JSON-in-text; if none, recover Qwen/GLM XML tool calls from
+            // the buffered stream (non-Ollama path uses live XML holdback, but
+            // self-hosted buffering skips that detector).
+            let recoveredCalls: Array<{
+              id: string
+              name: string
+              arguments: Record<string, unknown>
+            }> = []
+            let recoveredRanges: Array<[number, number]> = []
+            const { calls: textToolCalls, toolCallRanges } = parseTextToolCalls(
+              accumulatedText,
+              { allowedToolNames },
+            )
             if (textToolCalls.length > 0) {
+              recoveredCalls = textToolCalls
+              recoveredRanges = toolCallRanges
+            } else {
+              const xmlParsed = parseXmlToolCalls(
+                accumulatedText,
+                allowHy3ToolCalls,
+              )
+              if (xmlParsed.calls.length > 0) {
+                recoveredCalls = xmlParsed.calls
+                recoveredRanges = xmlParsed.toolCallRanges
+              }
+            }
+            if (recoveredCalls.length > 0) {
               ollamaClosedContentBlock = true
-              // Compute visible prose (tool-call JSON stripped, think-tags removed).
-              // Use accumulatedText (raw) as source because toolCallRanges are relative to it.
-              const stripped = stripRanges(accumulatedText, toolCallRanges).trim()
+              // Compute visible prose (tool-call payload stripped, think-tags removed).
+              // Use accumulatedText (raw) as source because ranges are relative to it.
+              const stripped = stripRanges(accumulatedText, recoveredRanges).trim()
               const strippedVisible = stripThinkTags(stripped).trim()
               if (hasEmittedContentStart) {
                 // Text block was already open — emit stripped prose then close it.
@@ -3197,7 +3280,7 @@ async function* openaiStreamToAnthropic(
                 }
                 yield* closeActiveContentBlock()
               }
-              for (const tc of textToolCalls) {
+              for (const tc of recoveredCalls) {
                 throwIfStreamAborted(signal)
                 const toolBlockIndex = contentBlockIndex
                 yield {
@@ -3629,6 +3712,7 @@ class OpenAIShimMessages {
         isLikelyOllamaEndpoint(request.baseUrl) ||
         (Boolean(params.tools?.length) &&
           shouldUseSelfHostedToolCompat(request.baseUrl))
+      const allowedToolNames = toolNamesFromShimParams(params.tools)
       const response = await self._doRequest(request, params, options, requestProcessEnv)
       httpResponse = response
 
@@ -3657,6 +3741,7 @@ class OpenAIShimMessages {
                       streamSignal,
                       enableTextToolCallFallback,
                       response.url || undefined,
+                      allowedToolNames,
                     ),
           options?.signal,
           cancelBeforeIteration,
@@ -3696,6 +3781,7 @@ class OpenAIShimMessages {
             parsed,
             request.resolvedModel,
             enableTextToolCallFallback,
+            allowedToolNames,
           )
         }
       }
@@ -3725,6 +3811,7 @@ class OpenAIShimMessages {
           data,
           request.resolvedModel,
           enableTextToolCallFallback,
+          allowedToolNames,
         )
       }
 
@@ -5113,9 +5200,11 @@ class OpenAIShimMessages {
     data: NonStreamingOpenAIResponse,
     model: string,
     enableTextToolCallFallback = false,
+    allowedToolNames?: ReadonlySet<string>,
   ) {
     return convertNonStreamingResponseToAnthropicMessage(data, model, {
       enableTextToolCallFallback,
+      allowedToolNames,
     })
   }
 

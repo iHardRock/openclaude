@@ -649,14 +649,23 @@ export function shouldInjectToolResultSemanticBoundary(options?: {
     return true
   }
 
-  const baseUrl = (
+  const baseUrl =
     options?.baseUrl ??
     processEnv.MISTRAL_BASE_URL ??
     processEnv.OPENAI_BASE_URL ??
     ''
-  ).toLowerCase()
-  if (baseUrl.includes('mistral.ai')) {
-    return true
+  // Hostname only — avoid false positives like https://mistral.ai-proxy.example/v1
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase()
+    if (
+      host === 'mistral.ai' ||
+      host === 'api.mistral.ai' ||
+      host.endsWith('.mistral.ai')
+    ) {
+      return true
+    }
+  } catch {
+    // Invalid URL — fall through to model-name detection.
   }
 
   const model = (
