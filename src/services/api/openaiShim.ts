@@ -2502,16 +2502,14 @@ export function parseXmlToolCalls(text: string, allowHy3 = false): {
   const addCall = (
     name: string,
     args: Record<string, unknown>,
-    range?: [number, number],
+    range: [number, number],
   ): boolean => {
     const dedupKey = `${name}:${JSON.stringify(args)}`
     if (seen.has(dedupKey)) return false
     seen.add(dedupKey)
     results.push({ id: `xml_tc_${++_textToolCallCounter}`, name, arguments: args })
     // Keep toolCallRanges 1:1 with calls (skip range for deduped blocks).
-    if (range) {
-      ranges.push(range)
-    }
+    ranges.push(range)
     return true
   }
 
