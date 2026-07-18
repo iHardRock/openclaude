@@ -506,3 +506,83 @@ describe('GLM streaming — XML tool calls', () => {
     })
   })
 })
+
+// Self-hosted buffering path (LAN llama-server) enables isOllamaStream-style
+// text buffering. XML recovery must still run at finish — otherwise Qwen/GLM
+// XML tool calls are flushed as plain text with end_turn.
+describe('Self-hosted streaming — XML tool calls with tools advertised', () => {
+  let originalFetch: FetchType
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+    process.env.OPENAI_API_KEY = 'none'
+    process.env.OPENAI_BASE_URL = 'http://192.168.1.10:8080/v1'
+  })
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    delete process.env.OPENAI_API_KEY
+    delete process.env.OPENAI_BASE_URL
+  })
+
+  test('recovers Qwen/GLM XML tool_use from buffered self-hosted stream', async () => {
+    const chunk = (content: string, finishReason?: string) => ({
+      id: 'chatcmpl-llama',
+      object: 'chat.completion.chunk',
+      model: 'qwen3.6:35b',
+      choices: [
+        {
+          index: 0,
+          delta: { content },
+          finish_reason: finishReason ?? null,
+        },
+      ],
+    })
+
+    globalThis.fetch = (async () =>
+      makeSseResponse(
+        makeChunks([
+          chunk(
+            '<tool_call><function=Bash><parameter=command>pwd</parameter></function></tool_call>',
+          ),
+          chunk('', 'stop'),
+        ]),
+      )) as unknown as FetchType
+
+    const client = createOpenAIShimClient({}) as OpenAIShimClient
+    const result = await client.beta.messages
+      .create({
+        model: 'qwen3.6:35b',
+        messages: [{ role: 'user', content: 'run pwd' }],
+        tools: [
+          {
+            name: 'Bash',
+            description: 'run shell',
+            input_schema: { type: 'object', properties: {} },
+          },
+        ],
+        max_tokens: 64,
+        stream: true,
+      })
+      .withResponse()
+
+    const events: Record<string, unknown>[] = []
+    for await (const event of result.data) events.push(event)
+
+    const starts = events.filter(
+      e =>
+        e.type === 'content_block_start' &&
+        (e.content_block as Record<string, string>)?.type === 'tool_use',
+    )
+    expect(starts).toHaveLength(1)
+    expect((starts[0].content_block as Record<string, string>).name).toBe('Bash')
+
+    const text = events
+      .filter(
+        e =>
+          e.type === 'content_block_delta' &&
+          (e.delta as Record<string, string>)?.type === 'text_delta',
+      )
+      .map(e => (e.delta as Record<string, string>).text)
+      .join('')
+    expect(text).not.toContain('<tool_call>')
+  })
+})
