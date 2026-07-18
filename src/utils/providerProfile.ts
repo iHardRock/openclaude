@@ -72,6 +72,7 @@ const PROFILE_ENV_KEYS = [
   'OPENAI_API_BASE',
   'OPENAI_MODEL',
   'OPENAI_API_FORMAT',
+  'OPENAI_AZURE_STYLE',
   'OPENAI_AUTH_HEADER',
   'OPENAI_AUTH_SCHEME',
   'OPENAI_AUTH_HEADER_VALUE',
@@ -159,6 +160,7 @@ export type ProfileEnv = {
   OPENAI_API_BASE?: string
   OPENAI_MODEL?: string
   OPENAI_API_FORMAT?: 'chat_completions' | 'responses' | 'responses_compat'
+  OPENAI_AZURE_STYLE?: string
   OPENAI_AUTH_HEADER?: string
   OPENAI_AUTH_SCHEME?: 'bearer' | 'raw'
   OPENAI_AUTH_HEADER_VALUE?: string
@@ -792,6 +794,7 @@ export function buildOpenAIProfileEnv(options: {
   baseUrl?: string | null
   apiKey?: string | null
   apiFormat?: 'chat_completions' | 'responses' | 'responses_compat' | null
+  azureStyle?: string | null
   authHeader?: string | null
   authScheme?: 'bearer' | 'raw' | null
   authHeaderValue?: string | null
@@ -877,6 +880,9 @@ export function buildOpenAIProfileEnv(options: {
     OPENAI_BASE_URL: resolvedBaseUrl,
     OPENAI_MODEL: normalizedModel,
     ...(options.apiFormat ? { OPENAI_API_FORMAT: options.apiFormat } : {}),
+    ...(isEnvTruthy(options.azureStyle ?? processEnv.OPENAI_AZURE_STYLE)
+      ? { OPENAI_AZURE_STYLE: '1' }
+      : {}),
     ...(options.authHeader ? { OPENAI_AUTH_HEADER: options.authHeader } : {}),
     ...(options.authScheme ? { OPENAI_AUTH_SCHEME: options.authScheme } : {}),
     ...(authHeaderValue ? { OPENAI_AUTH_HEADER_VALUE: authHeaderValue } : {}),
@@ -1415,6 +1421,7 @@ export async function buildLaunchEnv(options: {
     persistedEnv,
   )
   const persistedOpenAIApiFormat = persistedEnv.OPENAI_API_FORMAT
+  const persistedOpenAIAzureStyle = persistedEnv.OPENAI_AZURE_STYLE
   const persistedOpenAIAuthHeader = persistedEnv.OPENAI_AUTH_HEADER
   const persistedOpenAIAuthScheme = persistedEnv.OPENAI_AUTH_SCHEME
   const persistedOpenAIAuthHeaderValue = sanitizeApiKey(
@@ -1888,6 +1895,18 @@ export async function buildLaunchEnv(options: {
   } else {
     delete env.OPENAI_API_FORMAT
   }
+  const usePersistedAzureStyle =
+    processEnv.OPENAI_AZURE_STYLE === undefined &&
+    usePersistedOpenAIConfig &&
+    env.OPENAI_BASE_URL === persistedOpenAIBaseUrl
+  if (
+    isEnvTruthy(processEnv.OPENAI_AZURE_STYLE) ||
+    (usePersistedAzureStyle && isEnvTruthy(persistedOpenAIAzureStyle))
+  ) {
+    env.OPENAI_AZURE_STYLE = '1'
+  } else {
+    delete env.OPENAI_AZURE_STYLE
+  }
   const openAIAuthHeader =
     processEnv.OPENAI_AUTH_HEADER ||
     (usePersistedOpenAIConfig ? persistedOpenAIAuthHeader : undefined)
@@ -1991,6 +2010,27 @@ export async function buildLaunchEnv(options: {
       : undefined)
   if (contextWindows) {
     env.CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS = contextWindows
+  }
+
+  // Self-hosted tool recovery flags (profile.selfHostedTools / shell override).
+  // Shell wins over persisted, same as API format / context windows. Without
+  // this, applyProfileEnvToProcessEnv clears PROFILE_ENV_KEYS on relaunch and
+  // drops OPENAI_SELF_HOSTED_TOOLS even when the legacy profile file had it.
+  const selfHostedToolsFlag =
+    processEnv.OPENAI_SELF_HOSTED_TOOLS ||
+    (usePersistedOpenAIConfig
+      ? persistedEnv.OPENAI_SELF_HOSTED_TOOLS
+      : undefined)
+  if (selfHostedToolsFlag) {
+    env.OPENAI_SELF_HOSTED_TOOLS = selfHostedToolsFlag
+  }
+  const parseTextToolCallsFlag =
+    processEnv.OPENAI_PARSE_TEXT_TOOL_CALLS ||
+    (usePersistedOpenAIConfig
+      ? persistedEnv.OPENAI_PARSE_TEXT_TOOL_CALLS
+      : undefined)
+  if (parseTextToolCallsFlag) {
+    env.OPENAI_PARSE_TEXT_TOOL_CALLS = parseTextToolCallsFlag
   }
 
   return buildCompatibilityProcessEnv({

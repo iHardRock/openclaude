@@ -82,9 +82,12 @@ import {
   getLocalFastPathConfig,
   getLocalProviderRetryBaseUrls,
   getGithubEndpointType,
+  baseUrlSupportsResponsesAutoRoute,
+  isAzureStyleBaseUrl,
   isDirectLocalOllamaEndpoint,
   isLikelyOllamaEndpoint,
   isLocalProviderUrl,
+  modelRequiresResponsesApi,
   resolveRuntimeCodexCredentials,
   resolveProviderRequest,
   shouldAttemptLocalToollessRetry,
@@ -1714,6 +1717,7 @@ function parseAndAdd(
   raw: string,
   results: ParsedTextToolCall[],
   seen: Set<string>,
+  allowedToolNames?: ReadonlySet<string>,
 ): boolean {
   let obj: Record<string, unknown>
   try {
@@ -1726,15 +1730,35 @@ function parseAndAdd(
   let args: Record<string, unknown> = {}
 
   if (typeof obj['name'] === 'string') {
-    // {"name": "X", "arguments": {...}}
+    // Require a real tool-call shape: {"name":"X","arguments":...}.
+    // Person records / package.json {"name":"Alice"} must not match.
+    if (!('arguments' in obj)) {
+      return false
+    }
     name = obj['name'] as string
-    args = (obj['arguments'] as Record<string, unknown>) ?? {}
+    const rawArgs = obj['arguments']
+    if (typeof rawArgs === 'string') {
+      try {
+        args = JSON.parse(rawArgs) as Record<string, unknown>
+      } catch {
+        args = {}
+      }
+    } else if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+      args = rawArgs as Record<string, unknown>
+    } else if (rawArgs === undefined || rawArgs === null) {
+      args = {}
+    } else {
+      return false
+    }
   } else if (
     obj['type'] === 'function' &&
-    typeof (obj['function'] as any)?.name === 'string'
+    typeof (obj['function'] as { name?: unknown } | undefined)?.name === 'string'
   ) {
     // {"type":"function","function":{"name":"X","arguments":{...}}}
     const fn = obj['function'] as { name: string; arguments?: unknown }
+    if (!('arguments' in fn)) {
+      return false
+    }
     name = fn.name
     const rawArgs = fn.arguments
     args =
@@ -1746,10 +1770,15 @@ function parseAndAdd(
               return {}
             }
           })()
-        : (rawArgs as Record<string, unknown>) ?? {}
+        : rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
+          ? (rawArgs as Record<string, unknown>)
+          : {}
   }
 
   if (!name) return false
+  if (allowedToolNames && allowedToolNames.size > 0 && !allowedToolNames.has(name)) {
+    return false
+  }
 
   const dedupKey = `${name}:${JSON.stringify(args)}`
   if (seen.has(dedupKey)) return false
@@ -1771,11 +1800,37 @@ function stripRanges(text: string, ranges: Array<[number, number]>): string {
   return result + text.slice(pos)
 }
 
+/** Collect advertised tool names from Anthropic-shaped `tools` on shim create. */
+function toolNamesFromShimParams(tools: unknown): Set<string> | undefined {
+  if (!Array.isArray(tools) || tools.length === 0) {
+    return undefined
+  }
+  const names = new Set<string>()
+  for (const tool of tools) {
+    if (
+      tool &&
+      typeof tool === 'object' &&
+      typeof (tool as { name?: unknown }).name === 'string'
+    ) {
+      names.add((tool as { name: string }).name)
+    }
+  }
+  return names.size > 0 ? names : undefined
+}
+
 /** Exported for unit testing only. */
-export function parseTextToolCalls(text: string): {
+export function parseTextToolCalls(
+  text: string,
+  options?: { allowedToolNames?: ReadonlySet<string> | readonly string[] },
+): {
   calls: ParsedTextToolCall[]
   toolCallRanges: Array<[number, number]>
 } {
+  const allowedToolNames = options?.allowedToolNames
+    ? options.allowedToolNames instanceof Set
+      ? options.allowedToolNames
+      : new Set(options.allowedToolNames)
+    : undefined
   const results: ParsedTextToolCall[] = []
   const seen = new Set<string>()
   const fencedRanges: Array<[number, number]> = []
@@ -1795,7 +1850,7 @@ export function parseTextToolCalls(text: string): {
     if (after.length > 0 && !after.startsWith('{')) continue
     const range: [number, number] = [match.index!, match.index! + match[0].length]
     fencedRanges.push(range)
-    if (raw && parseAndAdd(raw, results, seen)) {
+    if (raw && parseAndAdd(raw, results, seen, allowedToolNames)) {
       acceptedRanges.push(range)
     }
   }
@@ -1815,7 +1870,7 @@ export function parseTextToolCalls(text: string): {
       if (after.length > 0 && !after.startsWith('{')) continue
       const range: [number, number] = [start, start + raw.length]
       processedRanges.push(range)
-      if (parseAndAdd(raw, results, seen)) {
+      if (parseAndAdd(raw, results, seen, allowedToolNames)) {
         acceptedRanges.push(range)
       }
     }
@@ -2394,9 +2449,13 @@ type NonStreamingOpenAIResponse = {
 function convertNonStreamingResponseToAnthropicMessage(
   data: NonStreamingOpenAIResponse,
   model: string,
-  options?: { enableTextToolCallFallback?: boolean },
+  options?: {
+    enableTextToolCallFallback?: boolean
+    allowedToolNames?: ReadonlySet<string> | readonly string[]
+  },
 ) {
   const enableTextToolCallFallback = options?.enableTextToolCallFallback === true
+  const allowedToolNames = options?.allowedToolNames
   const choice = data.choices?.[0]
   const content: Array<Record<string, unknown>> = []
   // An empty tool_calls array is still truthy; treat it as "no structured tool
@@ -2441,7 +2500,7 @@ function convertNonStreamingResponseToAnthropicMessage(
       // happens to end with {"name": ...}.
       if (enableTextToolCallFallback) {
         const { calls: textToolCalls, toolCallRanges: textRanges } =
-          parseTextToolCalls(strippedContent)
+          parseTextToolCalls(strippedContent, { allowedToolNames })
         if (textToolCalls.length > 0) {
           const visibleText = stripRanges(strippedContent, textRanges).trim()
           if (visibleText) content.push({ type: 'text', text: visibleText })
@@ -2568,6 +2627,7 @@ async function* openaiStreamToAnthropic(
    */
   isOllama = false,
   requestUrl?: string,
+  allowedToolNames?: ReadonlySet<string> | readonly string[],
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = makeMessageId()
   const allowHy3ToolCalls = isHy3Model(model)
@@ -2649,6 +2709,7 @@ async function* openaiStreamToAnthropic(
     // JSON-in-text recovery (Ollama / self-hosted tools).
     const message = convertNonStreamingResponseToAnthropicMessage(parsed, model, {
       enableTextToolCallFallback: isOllamaStream,
+      allowedToolNames,
     })
 
     yield {
@@ -3158,12 +3219,37 @@ async function* openaiStreamToAnthropic(
           const originalFinishReason = choice.finish_reason
           let ollamaClosedContentBlock = false
           if (isTerminalOllamaFinish) {
-            const { calls: textToolCalls, toolCallRanges } = parseTextToolCalls(accumulatedText)
+            // Prefer JSON-in-text; if none, recover Qwen/GLM XML tool calls from
+            // the buffered stream (non-Ollama path uses live XML holdback, but
+            // self-hosted buffering skips that detector).
+            let recoveredCalls: Array<{
+              id: string
+              name: string
+              arguments: Record<string, unknown>
+            }> = []
+            let recoveredRanges: Array<[number, number]> = []
+            const { calls: textToolCalls, toolCallRanges } = parseTextToolCalls(
+              accumulatedText,
+              { allowedToolNames },
+            )
             if (textToolCalls.length > 0) {
+              recoveredCalls = textToolCalls
+              recoveredRanges = toolCallRanges
+            } else {
+              const xmlParsed = parseXmlToolCalls(
+                accumulatedText,
+                allowHy3ToolCalls,
+              )
+              if (xmlParsed.calls.length > 0) {
+                recoveredCalls = xmlParsed.calls
+                recoveredRanges = xmlParsed.toolCallRanges
+              }
+            }
+            if (recoveredCalls.length > 0) {
               ollamaClosedContentBlock = true
-              // Compute visible prose (tool-call JSON stripped, think-tags removed).
-              // Use accumulatedText (raw) as source because toolCallRanges are relative to it.
-              const stripped = stripRanges(accumulatedText, toolCallRanges).trim()
+              // Compute visible prose (tool-call payload stripped, think-tags removed).
+              // Use accumulatedText (raw) as source because ranges are relative to it.
+              const stripped = stripRanges(accumulatedText, recoveredRanges).trim()
               const strippedVisible = stripThinkTags(stripped).trim()
               if (hasEmittedContentStart) {
                 // Text block was already open — emit stripped prose then close it.
@@ -3194,7 +3280,7 @@ async function* openaiStreamToAnthropic(
                 }
                 yield* closeActiveContentBlock()
               }
-              for (const tc of textToolCalls) {
+              for (const tc of recoveredCalls) {
                 throwIfStreamAborted(signal)
                 const toolBlockIndex = contentBlockIndex
                 yield {
@@ -3606,14 +3692,28 @@ class OpenAIShimMessages {
     let httpResponse: Response | undefined
 
     const promise = (async () => {
-      const request = resolveProviderRequest({ model: self.providerOverride?.model ?? params.model, baseUrl: self.providerOverride?.baseURL, reasoningEffortOverride: self.reasoningEffort })
+      // A provider override is a complete route, so it must not inherit an
+      // Azure-style escape hatch intended for the parent route.
+      const requestProcessEnv = self.providerOverride
+        ? {
+          ...process.env,
+          OPENAI_AZURE_STYLE: undefined,
+        }
+        : process.env
+      const request = resolveProviderRequest({
+        model: self.providerOverride?.model ?? params.model,
+        baseUrl: self.providerOverride?.baseURL,
+        reasoningEffortOverride: self.reasoningEffort,
+        processEnv: requestProcessEnv,
+      })
       // Shared stream + non-stream gate for JSON-in-text tool recovery.
       // Ollama always; other self-hosted only when tools are advertised.
       const enableTextToolCallFallback =
         isLikelyOllamaEndpoint(request.baseUrl) ||
         (Boolean(params.tools?.length) &&
           shouldUseSelfHostedToolCompat(request.baseUrl))
-      const response = await self._doRequest(request, params, options)
+      const allowedToolNames = toolNamesFromShimParams(params.tools)
+      const response = await self._doRequest(request, params, options, requestProcessEnv)
       httpResponse = response
 
       if (params.stream) {
@@ -3641,6 +3741,7 @@ class OpenAIShimMessages {
                       streamSignal,
                       enableTextToolCallFallback,
                       response.url || undefined,
+                      allowedToolNames,
                     ),
           options?.signal,
           cancelBeforeIteration,
@@ -3680,6 +3781,7 @@ class OpenAIShimMessages {
             parsed,
             request.resolvedModel,
             enableTextToolCallFallback,
+            allowedToolNames,
           )
         }
       }
@@ -3709,6 +3811,7 @@ class OpenAIShimMessages {
           data,
           request.resolvedModel,
           enableTextToolCallFallback,
+          allowedToolNames,
         )
       }
 
@@ -3739,6 +3842,7 @@ class OpenAIShimMessages {
     request: ReturnType<typeof resolveProviderRequest>,
     params: ShimCreateParams,
     options?: { signal?: AbortSignal; headers?: Record<string, string> },
+    requestProcessEnv: NodeJS.ProcessEnv = process.env,
   ): Promise<Response> {
     const githubEndpointType = getGithubEndpointType(request.baseUrl)
     const isGithubMode = isGithubModelsMode()
@@ -3843,13 +3947,14 @@ class OpenAIShimMessages {
       })
     }
 
-    return this._doOpenAIRequest(request, params, options)
+    return this._doOpenAIRequest(request, params, options, requestProcessEnv)
   }
 
   private async _doOpenAIRequest(
     request: ReturnType<typeof resolveProviderRequest>,
     params: ShimCreateParams,
     options?: { signal?: AbortSignal; headers?: Record<string, string> },
+    requestProcessEnv: NodeJS.ProcessEnv = process.env,
   ): Promise<Response> {
     // Local backends (llama.cpp, vLLM, Ollama, LM Studio, …) do not implement
     // the cloud-side caching/strict-validation behaviours that several of our
@@ -3866,7 +3971,7 @@ class OpenAIShimMessages {
       ? rawMessages
       : compressToolHistory(rawMessages, request.resolvedModel)
     const runtimeShimContext = resolveOpenAIShimRuntimeContext({
-      processEnv: process.env,
+      processEnv: requestProcessEnv,
       baseUrl: request.baseUrl,
       model: request.resolvedModel,
       treatAsLocal: isLocalProviderUrl(request.baseUrl),
@@ -3907,14 +4012,25 @@ class OpenAIShimMessages {
       routeId: runtimeShimContext.routeId,
       useRuntimeFallback: false,
       openaiShimConfig: shimConfig,
+      baseUrl: request.baseUrl,
+      processEnv: requestProcessEnv,
     })
+    // The explicit chat-completions escape hatch for GPT-5.4/5.5/5.6 must
+    // also omit reasoning effort: these models reject the tools + effort
+    // combination on that API surface.
+    const suppressReasoningForForcedChat =
+      effectiveTransport === 'chat_completions' &&
+      Array.isArray(params.tools) &&
+      params.tools.length > 0 &&
+      modelRequiresResponsesApi(request.resolvedModel) &&
+      baseUrlSupportsResponsesAutoRoute(request.baseUrl, requestProcessEnv)
     const reasoningRequestPlan = resolveOpenAIShimReasoningRequestPlan({
       model: request.resolvedModel,
-      requestedEffort: request.reasoning?.effort,
+      requestedEffort: suppressReasoningForForcedChat ? undefined : request.reasoning?.effort,
       requestThinkingType: (params.thinking as { type?: string } | undefined)?.type,
       defaultThinkingType: request.thinking?.type,
       thinkingRequestFormat: shimConfig.thinkingRequestFormat,
-      routeId: runtimeShimContext.routeId,
+      routeId: runtimeShimContext.routeId ?? 'custom',
       useRuntimeFallback: false,
       reasoningControl,
     })
@@ -3948,7 +4064,7 @@ class OpenAIShimMessages {
       body.max_completion_tokens = maxCompletionTokensValue
     }
 
-    if (params.stream && !isLikelyOllamaEndpoint(request.baseUrl)) {
+    if (params.stream && !isLocalProviderUrl(request.baseUrl)) {
       body.stream_options = { include_usage: true }
     }
 
@@ -4420,22 +4536,9 @@ class OpenAIShimMessages {
         new Headers(),
       )
     }
-    // Detect Azure endpoints by hostname (not raw URL) to prevent bypass via
-    // path segments like https://evil.com/cognitiveservices.azure.com/
-    let isAzure = isEnvTruthy(process.env.OPENAI_AZURE_STYLE)
-    if (!isAzure) {
-      try {
-        const { hostname } = new URL(request.baseUrl)
-        isAzure =
-          hostname.endsWith('.azure.com') &&
-          (hostname.includes('cognitiveservices') ||
-            hostname.includes('openai') ||
-            hostname.includes('services.ai') ||
-            hostname.includes('inference.ml'))
-      } catch {
-        /* malformed URL — not Azure */
-      }
-    }
+    // Reads live process.env by design; must agree with the responses
+    // auto-route gate's processEnv (both default to process.env today).
+    const isAzure = isAzureStyleBaseUrl(request.baseUrl, requestProcessEnv)
 
     let isBankr = false
     try {
@@ -4519,17 +4622,17 @@ class OpenAIShimMessages {
       // Azure Cognitive Services / Azure OpenAI require a deployment-specific
       // path and an api-version query parameter.
       if (isAzure) {
+        const normalizedBaseUrl = (baseUrl.split(/[?#]/, 1)[0] ?? baseUrl).replace(/\/+$/, '')
         const apiVersion = process.env.AZURE_OPENAI_API_VERSION ?? '2024-12-01-preview'
         const deployment = encodeURIComponent(request.resolvedModel ?? process.env.OPENAI_MODEL ?? 'gpt-4o')
 
         // If base URL already contains /deployments/, use it as-is with api-version.
-        if (/\/deployments\//i.test(baseUrl)) {
-          const normalizedBase = baseUrl.replace(/\/+$/, '')
-          return `${normalizedBase}/chat/completions?api-version=${apiVersion}`
+        if (/\/deployments\//i.test(normalizedBaseUrl)) {
+          return `${normalizedBaseUrl}/chat/completions?api-version=${apiVersion}`
         }
 
         // Strip trailing /v1 or /openai/v1 if present, then build Azure path.
-        const normalizedBase = baseUrl
+        const normalizedBase = normalizedBaseUrl
           .replace(/\/(openai\/)?v1\/?$/, '')
           .replace(/\/+$/, '')
 
@@ -4537,6 +4640,31 @@ class OpenAIShimMessages {
       }
 
       return `${baseUrl}/chat/completions`
+    }
+
+    // Azure serves the Responses API only on the v1 surface
+    // ({resource}/openai/v1/responses — model in the request body, no
+    // api-version, no deployment-scoped form), so any Azure-style base is
+    // normalized to it: trailing /openai/v1, /v1, and
+    // /openai/deployments/<dep> segments are stripped until stable (bases
+    // can carry several, e.g. /openai/deployments/<dep>/openai/v1), then
+    // /openai/v1/responses is appended.
+    // https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/responses
+    const buildResponsesUrl = (baseUrl: string): string => {
+      const trimmedBase = baseUrl.replace(/\/+$/, '')
+      if (!isAzure) {
+        return `${trimmedBase}/responses`
+      }
+      let normalizedBase = (trimmedBase.split(/[?#]/, 1)[0] ?? trimmedBase).replace(/\/+$/, '')
+      for (;;) {
+        const stripped = normalizedBase
+          .replace(/\/(openai\/)?v1$/i, '')
+          .replace(/\/openai\/deployments\/[^/]+$/i, '')
+          .replace(/\/+$/, '')
+        if (stripped === normalizedBase) break
+        normalizedBase = stripped
+      }
+      return `${normalizedBase}/openai/v1/responses`
     }
 
     const localRetryBaseUrls = isLocal
@@ -4551,7 +4679,7 @@ class OpenAIShimMessages {
         return buildOllamaChatUrl(baseUrl)
       }
       return request.transport === 'responses' || request.transport === 'responses_compat'
-        ? `${baseUrl}/responses`
+        ? buildResponsesUrl(baseUrl)
         : buildChatCompletionsUrl(baseUrl)
     }
 
@@ -5072,9 +5200,11 @@ class OpenAIShimMessages {
     data: NonStreamingOpenAIResponse,
     model: string,
     enableTextToolCallFallback = false,
+    allowedToolNames?: ReadonlySet<string>,
   ) {
     return convertNonStreamingResponseToAnthropicMessage(data, model, {
       enableTextToolCallFallback,
+      allowedToolNames,
     })
   }
 

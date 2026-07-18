@@ -1381,6 +1381,59 @@ export function normalizeMessagesForAPI(
   messages: Message[],
   tools: Tools = [],
 ): (UserMessage | AssistantMessage)[] {
+  const containsStripTarget = (
+    content: ContentBlockParam[],
+    types: Set<string>,
+  ): boolean => content.some(block =>
+    types.has(block.type) ||
+    (block.type === 'tool_result' &&
+      Array.isArray(block.content) &&
+      containsStripTarget(block.content as ContentBlockParam[], types)),
+  )
+  const stripTargetsFromContent = (
+    content: ContentBlockParam[],
+    types: Set<string>,
+  ): ContentBlockParam[] => content
+    .filter(block => !types.has(block.type))
+    .map(block => {
+      if (block.type !== 'tool_result' || !Array.isArray(block.content)) {
+        return block
+      }
+      const strippedContent = stripTargetsFromContent(
+        block.content as ContentBlockParam[],
+        types,
+      )
+      return {
+        ...block,
+        // A tool result must retain content to preserve the paired tool-use
+        // contract and avoid OpenAI-compatible providers rejecting an empty
+        // role: tool message after media is removed.
+        content: (strippedContent.length > 0
+          ? strippedContent
+          : [{ type: 'text', text: '[Media removed after provider rejection.]' }]
+        ) as typeof block.content,
+      }
+    })
+  const stripMediaFromUserMessage = (
+    message: UserMessage,
+    types: Set<string>,
+  ): UserMessage => {
+    const content = message.message.content
+    if (!Array.isArray(content)) return message
+    const filtered = stripTargetsFromContent(content, types)
+    return {
+      ...message,
+      message: {
+        ...message.message,
+        content: filtered.length > 0
+          ? filtered
+          : [{
+              type: 'text',
+              text: '[Media removed after provider rejection.]',
+            }],
+      },
+    }
+  }
   // Build set of available tool names for filtering unavailable tool references
   const availableToolNames = new Set(tools.map(t => t.name))
 
@@ -1426,6 +1479,16 @@ export function normalizeMessagesForAPI(
   // Walk the reordered messages to build a targeted strip map:
   // userMessageUUID → set of block types to strip from that message.
   const stripTargets = new Map<string, Set<string>>()
+  const addStripTarget = (uuid: string, types: Set<string>): void => {
+    const existing = stripTargets.get(uuid)
+    if (existing) {
+      for (const type of types) {
+        existing.add(type)
+      }
+      return
+    }
+    stripTargets.set(uuid, new Set(types))
+  }
   for (let i = 0; i < reorderedMessages.length; i++) {
     const msg = reorderedMessages[i]!
     if (!isSyntheticApiErrorMessage(msg)) {
@@ -1444,26 +1507,43 @@ export function normalizeMessagesForAPI(
     if (!blockTypesToStrip) {
       continue
     }
-    // Walk backward to find the nearest preceding isMeta user message
+    // Provider errors do not identify the rejected attachment. Strip the
+    // matching block type from every contiguous user message in this failed
+    // turn: choosing only one adjacent message can retain the bad payload and
+    // make every retry fail again.
     for (let j = i - 1; j >= 0; j--) {
       const candidate = reorderedMessages[j]!
-      if (candidate.type === 'user' && candidate.isMeta) {
-        const existing = stripTargets.get(candidate.uuid)
-        if (existing) {
-          for (const t of blockTypesToStrip) {
-            existing.add(t)
-          }
-        } else {
-          stripTargets.set(candidate.uuid, new Set(blockTypesToStrip))
+      if (candidate.type === 'user') {
+        const content = candidate.message.content
+        if (
+          !Array.isArray(content) ||
+          !containsStripTarget(content, blockTypesToStrip)
+        ) {
+          continue
         }
-        break
+        addStripTarget(candidate.uuid, blockTypesToStrip)
+        continue
       }
-      // Skip over other synthetic error messages or non-meta messages
+      if (candidate.type === 'attachment') {
+        const normalized = normalizeAttachmentForAPI(candidate.attachment)
+        if (normalized.some(message =>
+          Array.isArray(message.message.content) &&
+          containsStripTarget(message.message.content, blockTypesToStrip)
+        )) {
+          addStripTarget(candidate.uuid, blockTypesToStrip)
+        }
+        continue
+      }
+      // Skip over other synthetic error messages.
       if (isSyntheticApiErrorMessage(candidate)) {
         continue
       }
-      // Stop if we hit an assistant message or non-meta user message
-      break
+      // Only an assistant message starts an earlier API turn. Progress and
+      // filtered system records are not sent to the provider and must not
+      // prevent cleanup of media in the failed request.
+      if (candidate.type === 'assistant') {
+        break
+      }
     }
   }
 
@@ -1541,30 +1621,15 @@ export function normalizeMessagesForAPI(
             )
           }
 
-          // Strip document/image blocks from the specific meta user message that
+          // Strip document/image blocks from the specific user message that
           // preceded a PDF/image/request-too-large error, to prevent re-sending
           // the problematic content on every subsequent API call.
           const typesToStrip = stripTargets.get(normalizedMessage.uuid)
-          if (typesToStrip && normalizedMessage.isMeta) {
-            const content = normalizedMessage.message.content
-            if (Array.isArray(content)) {
-              const filtered = content.filter(
-                block => !typesToStrip.has(block.type),
-              )
-              if (filtered.length === 0) {
-                // All content blocks were stripped; skip this message entirely
-                return
-              }
-              if (filtered.length < content.length) {
-                normalizedMessage = {
-                  ...normalizedMessage,
-                  message: {
-                    ...normalizedMessage.message,
-                    content: filtered,
-                  },
-                }
-              }
-            }
+          if (typesToStrip) {
+            normalizedMessage = stripMediaFromUserMessage(
+              normalizedMessage,
+              typesToStrip,
+            )
           }
 
           // Server renders tool_reference expansion as <functions>...</functions>
@@ -1720,11 +1785,20 @@ export function normalizeMessagesForAPI(
           const rawAttachmentMessage = normalizeAttachmentForAPI(
             message.attachment,
           )
+          const typesToStrip = stripTargets.get(message.uuid)
+          const strippedAttachmentMessage = typesToStrip
+            ? rawAttachmentMessage.map(attachmentMessage => {
+                return stripMediaFromUserMessage(
+                  attachmentMessage,
+                  typesToStrip,
+                )
+              })
+            : rawAttachmentMessage
           const attachmentMessage = checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
             'tengu_chair_sermon',
           )
-            ? rawAttachmentMessage.map(ensureSystemReminderWrap)
-            : rawAttachmentMessage
+            ? strippedAttachmentMessage.map(ensureSystemReminderWrap)
+            : strippedAttachmentMessage
 
           // If the last message is also a user message, merge them
           const lastMessage = last(result)
@@ -1870,9 +1944,8 @@ export function mergeUserMessages(a: UserMessage, b: UserMessage): UserMessage {
     // operand is real user content, the result must not be flagged isMeta
     // (so internal snip ids get injected and it's treated as user-visible content).
     // Gated behind the full runtime check because changing isMeta semantics
-    // affects downstream callers (e.g., VCR fixture hashing in SDK harness
-    // tests), so this must only fire when snip is actually enabled — not
-    // for all ants.
+    // affects downstream callers (including attachment error recovery), so it
+    // must only fire when snip is actually enabled.
     const { isSnipRuntimeEnabled } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       require('../services/compact/snipCompact.js') as typeof import('../services/compact/snipCompact.js')

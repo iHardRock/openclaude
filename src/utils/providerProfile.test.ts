@@ -678,13 +678,14 @@ test('buildStartupEnvFromProfile preserves env-only NEAR AI setup without a save
   assert.equal(isDefaultStartupProviderEnv(env), false)
 })
 
-test('openai launch preserves shell responses format and custom auth overrides', async () => {
+test('openai launch does not apply persisted Azure mode to a shell-selected base', async () => {
   const env = await buildLaunchEnv({
     profile: 'openai',
     persisted: profile('openai', {
       OPENAI_BASE_URL: 'https://persisted.example/v1',
       OPENAI_MODEL: 'persisted-model',
       OPENAI_API_FORMAT: 'chat_completions',
+      OPENAI_AZURE_STYLE: '1',
       OPENAI_AUTH_HEADER: 'X-Persisted-Key',
       OPENAI_AUTH_SCHEME: 'raw',
       OPENAI_AUTH_HEADER_VALUE: 'persisted-secret',
@@ -705,6 +706,7 @@ test('openai launch preserves shell responses format and custom auth overrides',
   assert.equal(env.OPENAI_BASE_URL, 'https://shell.example/v1')
   assert.equal(env.OPENAI_MODEL, 'shell-model')
   assert.equal(env.OPENAI_API_FORMAT, 'responses')
+  assert.equal(env.OPENAI_AZURE_STYLE, undefined)
   assert.equal(env.OPENAI_AUTH_HEADER, 'api-key')
   assert.equal(env.OPENAI_AUTH_SCHEME, 'raw')
   assert.equal(env.OPENAI_AUTH_HEADER_VALUE, 'shell-secret')
@@ -2086,6 +2088,19 @@ test('openai profiles keep shell base and model when shell format is responses',
   assert.equal(env?.OPENAI_API_KEY, 'sk-live')
 })
 
+test('openai profiles persist Azure-style routing from the shell environment', () => {
+  const env = buildOpenAIProfileEnv({
+    goal: 'balanced',
+    processEnv: {
+      OPENAI_BASE_URL: 'https://azure.example/openai/v1',
+      OPENAI_API_KEY: 'azure-key',
+      OPENAI_AZURE_STYLE: '1',
+    },
+  })
+
+  assert.equal(env?.OPENAI_AZURE_STYLE, '1')
+})
+
 test('openai profiles use the first model from a semicolon-separated list', () => {
   const env = buildOpenAIProfileEnv({
     goal: 'balanced',
@@ -2217,6 +2232,43 @@ test('openai launch preserves invalid live pooled credentials for launch validat
   assert.equal(env.OPENAI_API_KEYS, 'key-a,SUA_CHAVE')
   assert.equal(env.OPENAI_API_KEY, undefined)
   assert.equal(hasInvalidOpenAICredentialPool(env.OPENAI_API_KEYS), true)
+})
+
+test('openai launch preserves persisted self-hosted tools flags on relaunch', async () => {
+  const env = await buildLaunchEnv({
+    profile: 'openai',
+    persisted: profile('openai', {
+      OPENAI_BASE_URL: 'http://172.16.30.12:8081/v1',
+      OPENAI_MODEL: 'qwen3.6:35b',
+      OPENAI_SELF_HOSTED_TOOLS: '1',
+      OPENAI_PARSE_TEXT_TOOL_CALLS: '1',
+    }),
+    goal: 'balanced',
+    processEnv: {},
+  })
+
+  assert.equal(env.OPENAI_SELF_HOSTED_TOOLS, '1')
+  assert.equal(env.OPENAI_PARSE_TEXT_TOOL_CALLS, '1')
+  assert.equal(env.OPENAI_BASE_URL, 'http://172.16.30.12:8081/v1')
+})
+
+test('openai launch prefers shell self-hosted tools flags over persisted', async () => {
+  const env = await buildLaunchEnv({
+    profile: 'openai',
+    persisted: profile('openai', {
+      OPENAI_BASE_URL: 'http://172.16.30.12:8081/v1',
+      OPENAI_MODEL: 'qwen3.6:35b',
+      OPENAI_SELF_HOSTED_TOOLS: '1',
+    }),
+    goal: 'balanced',
+    processEnv: {
+      OPENAI_SELF_HOSTED_TOOLS: 'true',
+      OPENAI_PARSE_TEXT_TOOL_CALLS: '1',
+    },
+  })
+
+  assert.equal(env.OPENAI_SELF_HOSTED_TOOLS, 'true')
+  assert.equal(env.OPENAI_PARSE_TEXT_TOOL_CALLS, '1')
 })
 test('openai launch lets a live singular key override a saved pool', async () => {
   const env = await buildLaunchEnv({

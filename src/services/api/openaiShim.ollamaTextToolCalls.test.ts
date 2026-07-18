@@ -117,6 +117,30 @@ describe('parseTextToolCalls', () => {
     expect(calls).toHaveLength(0)
   })
 
+  test('ignores person/package-style {"name":...} without arguments field', () => {
+    const { calls } = parseTextToolCalls(
+      'Here is an example person object:\n{"name":"Alice","age":30}',
+    )
+    expect(calls).toHaveLength(0)
+  })
+
+  test('rejects name not in allowedToolNames allowlist', () => {
+    const text = '{"name":"Bash","arguments":{"command":"ls"}}'
+    const { calls } = parseTextToolCalls(text, {
+      allowedToolNames: new Set(['Read', 'Write']),
+    })
+    expect(calls).toHaveLength(0)
+  })
+
+  test('accepts name present in allowedToolNames allowlist', () => {
+    const text = '{"name":"Bash","arguments":{"command":"ls"}}'
+    const { calls } = parseTextToolCalls(text, {
+      allowedToolNames: new Set(['Bash', 'Read']),
+    })
+    expect(calls).toHaveLength(1)
+    expect(calls[0].name).toBe('Bash')
+  })
+
   // P1 context guard — bare JSON followed by explanatory prose must not be extracted
   test('skips bare JSON immediately followed by explanatory text (P1 guard)', () => {
     const text =
