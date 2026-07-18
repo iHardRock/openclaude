@@ -48,6 +48,21 @@ function makeChunks(chunks: unknown[]): string[] {
   return [...chunks.map(c => `data: ${JSON.stringify(c)}\n\n`), 'data: [DONE]\n\n']
 }
 
+/** Local mirror of stripRanges for unit assertions (not exported from shim). */
+function stripRangesForTest(
+  text: string,
+  ranges: Array<[number, number]>,
+): string {
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0])
+  let result = ''
+  let pos = 0
+  for (const [s, e] of sorted) {
+    result += text.slice(pos, s)
+    pos = e
+  }
+  return result + text.slice(pos)
+}
+
 const glmChunk = (content: string, finishReason?: string) => ({
   id: 'chatcmpl-glm',
   object: 'chat.completion.chunk',
@@ -232,6 +247,20 @@ describe('parseXmlToolCalls', () => {
     const block = '<tool_call><function=Read><parameter=file_path>a.ts</parameter></function></tool_call>'
     const { calls } = parseXmlToolCalls(block + '\n' + block)
     expect(calls).toHaveLength(1)
+  })
+
+  test('stripToolCallRanges covers every duplicate XML block (1:1 toolCallRanges stays unique)', () => {
+    // Regression: dedup must not leave a second identical <tool_call> visible.
+    const block =
+      '<tool_call><function=Bash><parameter=command>pwd</parameter></function></tool_call>'
+    const text = `${block}\n${block}\nnext`
+    const { calls, toolCallRanges, stripToolCallRanges } = parseXmlToolCalls(text)
+    expect(calls).toHaveLength(1)
+    expect(toolCallRanges).toHaveLength(1)
+    expect(stripToolCallRanges).toHaveLength(2)
+    const stripped = stripRangesForTest(text, stripToolCallRanges)
+    expect(stripped).not.toContain('<tool_call>')
+    expect(stripped).toContain('next')
   })
 
   test('truncated block (no closing tag) still parses', () => {
