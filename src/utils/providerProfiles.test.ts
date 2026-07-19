@@ -383,6 +383,42 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(process.env.OPENAI_BASE_URL).toBe('https://llama.example.com:8443/v1')
   })
 
+  test('shell OPENAI_SELF_HOSTED_TOOLS override keeps process env aligned with profile', async () => {
+    const {
+      applyProviderProfileToProcessEnv,
+      applyActiveProviderProfileFromConfig,
+      _resetShellSelfHostedOverridesForTests,
+    } = await importFreshProviderProfileModules()
+    _resetShellSelfHostedOverridesForTests()
+
+    // Shell forces recovery on while profile UI says Disabled — apply still
+    // restores shell, and alignment must treat that as expected (no re-loop).
+    process.env.OPENAI_SELF_HOSTED_TOOLS = '1'
+
+    const profile = buildProfile({
+      id: 'provider_self_hosted_shell_align',
+      selfHostedTools: false,
+      baseUrl: 'https://llama.example.com:8443/v1',
+      model: 'qwen3.6:35b',
+    })
+    mockConfigState = {
+      ...mockConfigState,
+      providerProfiles: [profile],
+      activeProviderProfileId: profile.id,
+    }
+
+    applyProviderProfileToProcessEnv(profile)
+    expect(String(process.env.OPENAI_SELF_HOSTED_TOOLS)).toBe('1')
+
+    const restored = applyActiveProviderProfileFromConfig(
+      { ...mockConfigState } as any,
+      { processEnv: process.env, force: false },
+    )
+    // Aligned → no forced re-apply needed; profile still active, shell flag kept.
+    expect(restored?.id).toBe(profile.id)
+    expect(String(process.env.OPENAI_SELF_HOSTED_TOOLS)).toBe('1')
+  })
+
   test('isProcessEnvAlignedWithProfile detects OPENAI_SELF_HOSTED_TOOLS drift', async () => {
     const {
       applyProviderProfileToProcessEnv,

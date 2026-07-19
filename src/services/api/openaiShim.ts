@@ -4107,6 +4107,7 @@ class OpenAIShimMessages {
       injectToolResultSemanticBoundary: shouldInjectToolResultSemanticBoundary({
         baseUrl: request.baseUrl,
         model: request.resolvedModel,
+        processEnv: requestProcessEnv,
       }),
     })
 
