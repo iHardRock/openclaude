@@ -135,15 +135,36 @@ export function providerProfileSupportsSelfHostedTools(
   return resolveProfileCompatibility(provider).compatibilityMode === 'openai'
 }
 
-/** Attach OPENAI_SELF_HOSTED_TOOLS when the profile opts in. */
+/**
+ * Attach OPENAI_SELF_HOSTED_TOOLS from the profile UI toggle.
+ * - true  → '1' (force recovery on any host)
+ * - false → '0' (force recovery off, including local URLs)
+ * - undefined → leave unset (local/Ollama auto-detect still applies)
+ */
 export function applySelfHostedToolsProfileEnv(
   env: ProfileEnv,
   selfHostedTools?: boolean,
 ): ProfileEnv {
-  if (!selfHostedTools) {
-    return env
+  if (selfHostedTools === true) {
+    return { ...env, OPENAI_SELF_HOSTED_TOOLS: '1' }
   }
-  return { ...env, OPENAI_SELF_HOSTED_TOOLS: '1' }
+  if (selfHostedTools === false) {
+    return { ...env, OPENAI_SELF_HOSTED_TOOLS: '0' }
+  }
+  return env
+}
+
+/** Re-apply shell-origin self-hosted flags after managed profile env cleanup. */
+export function restoreShellSelfHostedOverrides(
+  processEnv: NodeJS.ProcessEnv = process.env,
+): void {
+  // Use !== undefined so an explicit empty shell value still wins.
+  if (shellSelfHostedToolsOverride !== undefined) {
+    processEnv.OPENAI_SELF_HOSTED_TOOLS = shellSelfHostedToolsOverride
+  }
+  if (shellParseTextToolCallsOverride !== undefined) {
+    processEnv.OPENAI_PARSE_TEXT_TOOL_CALLS = shellParseTextToolCallsOverride
+  }
 }
 
 type ProfileCompatibilityMode =
@@ -408,9 +429,11 @@ function sanitizeProfile(profile: ProviderProfile): ProviderProfile | null {
   }
   if (
     providerProfileSupportsSelfHostedTools(provider) &&
-    profile.selfHostedTools === true
+    typeof profile.selfHostedTools === 'boolean'
   ) {
-    sanitized.selfHostedTools = true
+    // Persist both true and false so UI "Disabled" survives reload and can
+    // force recovery off for local URLs (auto-detect otherwise re-enables it).
+    sanitized.selfHostedTools = profile.selfHostedTools
   }
   return sanitized
 }
@@ -813,7 +836,11 @@ function isProcessEnvAlignedWithProfile(
     ) &&
     sameOptionalEnvValue(
       processEnv.OPENAI_SELF_HOSTED_TOOLS,
-      profile.selfHostedTools ? '1' : undefined,
+      profile.selfHostedTools === true
+        ? '1'
+        : profile.selfHostedTools === false
+          ? '0'
+          : undefined,
     ) &&
     (!includeApiKey ||
       sameOptionalEnvValue(processEnv.OPENAI_API_KEY, profile.apiKey)) &&
@@ -914,7 +941,16 @@ export function clearActiveProviderProfile(
 export function clearProviderProfileEnvFromProcessEnv(
   processEnv: NodeJS.ProcessEnv = process.env,
 ): void {
+  // Capture shell-origin values before managed cleanup deletes PROFILE_ENV_KEYS
+  // (includes OPENAI_SELF_HOSTED_TOOLS). clearActiveProviderProfile / Anthropic
+  // selection use this path and do not re-run applyProviderProfileToProcessEnv.
+  if (processEnv === process.env) {
+    captureShellSelfHostedOverridesIfNeeded()
+  }
   clearManagedProfileEnv(processEnv)
+  if (processEnv === process.env) {
+    restoreShellSelfHostedOverrides(processEnv)
+  }
   delete processEnv[PROFILE_ENV_APPLIED_FLAG]
   delete processEnv[PROFILE_ENV_APPLIED_ID]
 }
@@ -1117,14 +1153,10 @@ export function applyProviderProfileToProcessEnv(
   clearProviderProfileEnvFromProcessEnv()
   Object.assign(process.env, nextEnv)
   // Re-apply shell-origin overrides only (not prior profile-managed values).
-  // Use !== undefined so an explicit empty shell value still clears/overwrites
-  // a profile-managed flag (truthiness would skip '').
-  if (shellSelfHostedToolsOverride !== undefined) {
-    process.env.OPENAI_SELF_HOSTED_TOOLS = shellSelfHostedToolsOverride
-  }
-  if (shellParseTextToolCallsOverride !== undefined) {
-    process.env.OPENAI_PARSE_TEXT_TOOL_CALLS = shellParseTextToolCallsOverride
-  }
+  // clearProviderProfileEnvFromProcessEnv already restores shell flags after
+  // cleanup; re-apply again after Object.assign so profile-managed values do
+  // not override a genuine shell export.
+  restoreShellSelfHostedOverrides()
   process.env[PROFILE_ENV_APPLIED_FLAG] = '1'
   process.env[PROFILE_ENV_APPLIED_ID] = profile.id
 }
