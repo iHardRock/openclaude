@@ -201,9 +201,9 @@ const FORM_STEPS: Array<{
   {
     key: 'selfHostedTools',
     label: 'Self-hosted tools',
-    placeholder: 'enabled',
+    placeholder: 'auto',
     helpText:
-      'For llama-server / vLLM / Ollama on this profile only. Enables JSON-in-text tool recovery. No shell env. Other providers unchanged.',
+      'For llama-server / vLLM / Ollama on this profile only. Automatic = local auto-detect; Enabled/Disabled force recovery on or off. No shell env.',
     optional: true,
   },
   {
@@ -262,7 +262,12 @@ function toDraft(profile: ProviderProfile): ProviderDraft {
     model: profile.model,
     apiKey: profile.apiKey ?? '',
     apiFormat: profile.apiFormat ?? 'auto',
-    selfHostedTools: profile.selfHostedTools ? 'enabled' : 'disabled',
+    selfHostedTools:
+      profile.selfHostedTools === true
+        ? 'enabled'
+        : profile.selfHostedTools === false
+          ? 'disabled'
+          : 'auto',
     authHeader: profile.authHeader ?? '',
     authHeaderValue: profile.authHeaderValue ?? '',
     customHeaders: serializeProfileCustomHeaders(profile.customHeaders) ?? '',
@@ -298,7 +303,12 @@ function presetToDraft(preset: ProviderPreset): ProviderDraft {
     model: defaults.model,
     apiKey: defaults.apiKey ?? '',
     apiFormat: preset === 'custom' ? 'auto' : 'chat_completions',
-    selfHostedTools: defaults.selfHostedTools ? 'enabled' : 'disabled',
+    selfHostedTools:
+      defaults.selfHostedTools === true
+        ? 'enabled'
+        : defaults.selfHostedTools === false
+          ? 'disabled'
+          : 'auto',
     authHeader: '',
     authHeaderValue: '',
     customHeaders: '',
@@ -1720,6 +1730,10 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
           : undefined,
       selfHostedTools: providerProfileSupportsSelfHostedTools(provider)
         ? nextDraft.selfHostedTools === 'enabled'
+          ? true
+          : nextDraft.selfHostedTools === 'disabled'
+            ? false
+            : undefined
         : undefined,
     }
 
@@ -2226,6 +2240,12 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
           <Select
             options={[
               {
+                value: 'auto',
+                label: 'Automatic',
+                description:
+                  'Auto-detect for local/Ollama URLs; no forced on/off on this profile',
+              },
+              {
                 value: 'disabled',
                 label: 'Disabled',
                 description:
@@ -2238,11 +2258,19 @@ export function ProviderManager({ mode, onDone }: Props): React.ReactNode {
                   'Self-hosted for this profile: JSON-in-text tools (llama-server, vLLM, Ollama)',
               },
             ]}
-            defaultValue={currentValue === 'enabled' ? 'enabled' : 'disabled'}
-            defaultFocusValue={currentValue === 'enabled' ? 'enabled' : 'disabled'}
+            defaultValue={
+              currentValue === 'enabled' || currentValue === 'disabled'
+                ? currentValue
+                : 'auto'
+            }
+            defaultFocusValue={
+              currentValue === 'enabled' || currentValue === 'disabled'
+                ? currentValue
+                : 'auto'
+            }
             onChange={(value: string) => handleFormSubmit(value)}
             onCancel={handleBackFromForm}
-            visibleOptionCount={2}
+            visibleOptionCount={3}
           />
         ) : currentStepKey === 'apiFormat' ? (
           <Select

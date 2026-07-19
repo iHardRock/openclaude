@@ -863,11 +863,14 @@ function isProcessEnvAlignedWithProfile(
     ) &&
     sameOptionalEnvValue(
       processEnv.OPENAI_SELF_HOSTED_TOOLS,
-      profile.selfHostedTools === true
-        ? '1'
-        : profile.selfHostedTools === false
-          ? '0'
-          : undefined,
+      // Match applyProviderProfileToProcessEnv: shell override wins when present.
+      shellSelfHostedToolsOverride !== undefined
+        ? shellSelfHostedToolsOverride
+        : profile.selfHostedTools === true
+          ? '1'
+          : profile.selfHostedTools === false
+            ? '0'
+            : undefined,
     ) &&
     (!includeApiKey ||
       sameOptionalEnvValue(processEnv.OPENAI_API_KEY, profile.apiKey)) &&
