@@ -331,7 +331,9 @@ describe('applyProviderProfileToProcessEnv', () => {
     const {
       applyProviderProfileToProcessEnv,
       clearProviderProfileEnvFromProcessEnv,
+      _resetShellSelfHostedOverridesForTests,
     } = await importFreshProviderProfileModules()
+    _resetShellSelfHostedOverridesForTests()
 
     applyProviderProfileToProcessEnv(
       buildProfile({
@@ -353,12 +355,17 @@ describe('applyProviderProfileToProcessEnv', () => {
         model: 'gpt-4o',
       }),
     )
-    expect(process.env.OPENAI_SELF_HOSTED_TOOLS).toBeUndefined()
+    // Explicit Disabled persists as '0' so local auto-detect cannot re-enable.
+    // String() avoids TS control-flow narrowing after delete above.
+    expect(String(process.env.OPENAI_SELF_HOSTED_TOOLS)).toBe('0')
   })
 
   test('shell OPENAI_SELF_HOSTED_TOOLS survives profile activation without UI flag', async () => {
-    const { applyProviderProfileToProcessEnv } =
-      await importFreshProviderProfileModules()
+    const {
+      applyProviderProfileToProcessEnv,
+      _resetShellSelfHostedOverridesForTests,
+    } = await importFreshProviderProfileModules()
+    _resetShellSelfHostedOverridesForTests()
 
     process.env.OPENAI_SELF_HOSTED_TOOLS = '1'
     process.env.OPENAI_PARSE_TEXT_TOOL_CALLS = '1'
@@ -374,6 +381,141 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(process.env.OPENAI_SELF_HOSTED_TOOLS).toBe('1')
     expect(process.env.OPENAI_PARSE_TEXT_TOOL_CALLS).toBe('1')
     expect(process.env.OPENAI_BASE_URL).toBe('https://llama.example.com:8443/v1')
+  })
+
+  test('shell OPENAI_SELF_HOSTED_TOOLS override keeps process env aligned with profile', async () => {
+    const {
+      applyProviderProfileToProcessEnv,
+      applyActiveProviderProfileFromConfig,
+      _resetShellSelfHostedOverridesForTests,
+    } = await importFreshProviderProfileModules()
+    _resetShellSelfHostedOverridesForTests()
+
+    // Shell forces recovery on while profile UI says Disabled — apply still
+    // restores shell, and alignment must treat that as expected (no re-loop).
+    process.env.OPENAI_SELF_HOSTED_TOOLS = '1'
+
+    const profile = buildProfile({
+      id: 'provider_self_hosted_shell_align',
+      selfHostedTools: false,
+      baseUrl: 'https://llama.example.com:8443/v1',
+      model: 'qwen3.6:35b',
+    })
+    mockConfigState = {
+      ...mockConfigState,
+      providerProfiles: [profile],
+      activeProviderProfileId: profile.id,
+    }
+
+    applyProviderProfileToProcessEnv(profile)
+    expect(String(process.env.OPENAI_SELF_HOSTED_TOOLS)).toBe('1')
+
+    const restored = applyActiveProviderProfileFromConfig(
+      { ...mockConfigState } as any,
+      { processEnv: process.env, force: false },
+    )
+    // Aligned → no forced re-apply needed; profile still active, shell flag kept.
+    expect(restored?.id).toBe(profile.id)
+    expect(String(process.env.OPENAI_SELF_HOSTED_TOOLS)).toBe('1')
+  })
+
+  test('isProcessEnvAlignedWithProfile detects OPENAI_SELF_HOSTED_TOOLS drift', async () => {
+    const {
+      applyProviderProfileToProcessEnv,
+      applyActiveProviderProfileFromConfig,
+      _resetShellSelfHostedOverridesForTests,
+    } = await importFreshProviderProfileModules()
+    _resetShellSelfHostedOverridesForTests()
+
+    const profile = buildProfile({
+      id: 'provider_self_hosted_align',
+      selfHostedTools: true,
+      baseUrl: 'https://llama.example.com:8443/v1',
+      model: 'qwen3.6:35b',
+    })
+
+    mockConfigState = {
+      ...mockConfigState,
+      providerProfiles: [profile],
+      activeProviderProfileId: profile.id,
+    }
+
+    applyProviderProfileToProcessEnv(profile)
+    expect(String(process.env.OPENAI_SELF_HOSTED_TOOLS)).toBe('1')
+
+    // Simulate external clear of the flag while profile is still marked applied.
+    delete process.env.OPENAI_SELF_HOSTED_TOOLS
+
+    // Alignment must fail → re-apply restores the profile flag.
+    const restored = applyActiveProviderProfileFromConfig(
+      {
+        ...mockConfigState,
+      } as any,
+      { processEnv: process.env, force: false },
+    )
+    expect(restored?.id).toBe(profile.id)
+    expect(String(process.env.OPENAI_SELF_HOSTED_TOOLS)).toBe('1')
+  })
+
+  test('selfHostedTools true→false activation clears flag (prior profile not shell)', async () => {
+    const {
+      applyProviderProfileToProcessEnv,
+      _resetShellSelfHostedOverridesForTests,
+    } = await importFreshProviderProfileModules()
+    _resetShellSelfHostedOverridesForTests()
+
+    // No shell export — first activation enables via profile.
+    delete process.env.OPENAI_SELF_HOSTED_TOOLS
+    delete process.env.OPENAI_PARSE_TEXT_TOOL_CALLS
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        id: 'provider_self_hosted_on',
+        selfHostedTools: true,
+        baseUrl: 'https://llama.example.com:8443/v1',
+        model: 'qwen3.6:35b',
+      }),
+    )
+    // String() avoids TS control-flow narrowing after delete above.
+    expect(String(process.env.OPENAI_SELF_HOSTED_TOOLS)).toBe('1')
+
+    // Second activation with selfHostedTools=false must force-disable — must not
+    // treat the previous profile's '1' as a shell override.
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        id: 'provider_self_hosted_off',
+        selfHostedTools: false,
+        baseUrl: 'https://llama.example.com:8443/v1',
+        model: 'qwen3.6:35b',
+      }),
+    )
+    expect(String(process.env.OPENAI_SELF_HOSTED_TOOLS)).toBe('0')
+  })
+
+  test('shell OPENAI_SELF_HOSTED_TOOLS survives clearActiveProviderProfile', async () => {
+    const {
+      applyProviderProfileToProcessEnv,
+      clearActiveProviderProfile,
+      _resetShellSelfHostedOverridesForTests,
+    } = await importFreshProviderProfileModules()
+    _resetShellSelfHostedOverridesForTests()
+
+    process.env.OPENAI_SELF_HOSTED_TOOLS = '1'
+    process.env.OPENAI_PARSE_TEXT_TOOL_CALLS = '1'
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        selfHostedTools: true,
+        baseUrl: 'https://llama.example.com:8443/v1',
+        model: 'qwen3.6:35b',
+      }),
+    )
+    expect(String(process.env.OPENAI_SELF_HOSTED_TOOLS)).toBe('1')
+
+    // Switching to built-in Anthropic must not delete genuine shell overrides.
+    clearActiveProviderProfile()
+    expect(process.env.OPENAI_SELF_HOSTED_TOOLS).toBe('1')
+    expect(process.env.OPENAI_PARSE_TEXT_TOOL_CALLS).toBe('1')
   })
 
   test('mistral profile sets CLAUDE_CODE_USE_MISTRAL and clears openai flags', async () => {

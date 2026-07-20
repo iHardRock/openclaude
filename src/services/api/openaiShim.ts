@@ -1713,21 +1713,58 @@ function extractBalancedJson(text: string, start: number): string | null {
   return null
 }
 
+/**
+ * Decode a tool-call `arguments` value to a plain object.
+ * Rejects arrays, primitives, and malformed JSON strings (no silent `{}`).
+ * `null` / `undefined` → empty object (explicit empty args).
+ */
+function decodeToolCallArguments(
+  rawArgs: unknown,
+): Record<string, unknown> | null {
+  if (rawArgs === undefined || rawArgs === null) {
+    return {}
+  }
+  if (typeof rawArgs === 'string') {
+    try {
+      rawArgs = JSON.parse(rawArgs)
+    } catch {
+      return null
+    }
+  }
+  if (
+    rawArgs &&
+    typeof rawArgs === 'object' &&
+    !Array.isArray(rawArgs)
+  ) {
+    return rawArgs as Record<string, unknown>
+  }
+  return null
+}
+
 function parseAndAdd(
   raw: string,
   results: ParsedTextToolCall[],
   seen: Set<string>,
   allowedToolNames?: ReadonlySet<string>,
 ): boolean {
-  let obj: Record<string, unknown>
+  let parsed: unknown
   try {
-    obj = JSON.parse(raw)
+    parsed = JSON.parse(raw)
   } catch {
     return false
   }
+  // Reject null / primitives / arrays — only plain objects are tool envelopes.
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    Array.isArray(parsed)
+  ) {
+    return false
+  }
+  const obj = parsed as Record<string, unknown>
 
   let name: string | undefined
-  let args: Record<string, unknown> = {}
+  let args: Record<string, unknown> | null = null
 
   if (typeof obj['name'] === 'string') {
     // Require a real tool-call shape: {"name":"X","arguments":...}.
@@ -1736,20 +1773,7 @@ function parseAndAdd(
       return false
     }
     name = obj['name'] as string
-    const rawArgs = obj['arguments']
-    if (typeof rawArgs === 'string') {
-      try {
-        args = JSON.parse(rawArgs) as Record<string, unknown>
-      } catch {
-        args = {}
-      }
-    } else if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
-      args = rawArgs as Record<string, unknown>
-    } else if (rawArgs === undefined || rawArgs === null) {
-      args = {}
-    } else {
-      return false
-    }
+    args = decodeToolCallArguments(obj['arguments'])
   } else if (
     obj['type'] === 'function' &&
     typeof (obj['function'] as { name?: unknown } | undefined)?.name === 'string'
@@ -1760,22 +1784,10 @@ function parseAndAdd(
       return false
     }
     name = fn.name
-    const rawArgs = fn.arguments
-    args =
-      typeof rawArgs === 'string'
-        ? (() => {
-            try {
-              return JSON.parse(rawArgs)
-            } catch {
-              return {}
-            }
-          })()
-        : rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
-          ? (rawArgs as Record<string, unknown>)
-          : {}
+    args = decodeToolCallArguments(fn.arguments)
   }
 
-  if (!name) return false
+  if (!name || args === null) return false
   if (allowedToolNames && allowedToolNames.size > 0 && !allowedToolNames.has(name)) {
     return false
   }
@@ -2009,17 +2021,33 @@ function findXmlToolCallOpener(text: string, allowHy3: boolean): number {
 /** Exported for unit testing only. */
 export function parseXmlToolCalls(text: string, allowHy3 = false): {
   calls: ParsedTextToolCall[]
+  /** 1:1 with `calls` (unique tool invocations only). */
   toolCallRanges: Array<[number, number]>
+  /**
+   * Every matching XML block range, including duplicates of the same call.
+   * Use for stripRanges so repeated identical tool XML does not remain visible.
+   */
+  stripToolCallRanges: Array<[number, number]>
 } {
   const results: ParsedTextToolCall[] = []
   const seen = new Set<string>()
   const ranges: Array<[number, number]> = []
+  const stripRangesAll: Array<[number, number]> = []
 
-  const addCall = (name: string, args: Record<string, unknown>) => {
+  const addCall = (
+    name: string,
+    args: Record<string, unknown>,
+    range: [number, number],
+  ): boolean => {
+    // Always retain the block for stripping, even when the call is deduped.
+    stripRangesAll.push(range)
     const dedupKey = `${name}:${JSON.stringify(args)}`
-    if (seen.has(dedupKey)) return
+    if (seen.has(dedupKey)) return false
     seen.add(dedupKey)
     results.push({ id: `xml_tc_${++_textToolCallCounter}`, name, arguments: args })
+    // Keep toolCallRanges 1:1 with emitted (unique) calls.
+    ranges.push(range)
+    return true
   }
 
   const hy3Blocks = allowHy3
@@ -2049,13 +2077,12 @@ export function parseXmlToolCalls(text: string, allowHy3 = false): {
     const { name, args } = block.parsed
     if (!name) continue
     const range = block.range
-    if (!hy3WrapperRanges.some(wrapper => wrapper[0] <= range[0] && range[1] <= wrapper[1])) {
-      ranges.push(range)
-    }
-    addCall(name, args)
+    // Prefer outer wrapper range for strip when present; keep 1:1 with calls.
+    const outer = hy3WrapperRanges.find(
+      wrapper => wrapper[0] <= range[0] && range[1] <= wrapper[1],
+    )
+    addCall(name, args, outer ?? range)
   }
-
-  ranges.push(...hy3WrapperRanges)
 
   for (const block of text.matchAll(XML_TOOL_CALL_BLOCK_RE)) {
     const inner = block[1] ?? ''
@@ -2111,11 +2138,14 @@ export function parseXmlToolCalls(text: string, allowHy3 = false): {
     }
 
     if (!name) continue
-    ranges.push(range)
-    addCall(name, args)
+    addCall(name, args, range)
   }
 
-  return { calls: results, toolCallRanges: ranges }
+  return {
+    calls: results,
+    toolCallRanges: ranges,
+    stripToolCallRanges: stripRangesAll,
+  }
 }
 
 /**
@@ -2477,12 +2507,12 @@ function convertNonStreamingResponseToAnthropicMessage(
   const appendTextOrRecoveredToolCalls = (rawText: string) => {
     const strippedContent = stripThinkTags(rawText)
     if (!hasStructuredToolCalls) {
-      const { calls: xmlToolCalls, toolCallRanges } = parseXmlToolCalls(
-        strippedContent,
-        isHy3Model(model),
-      )
+      const {
+        calls: xmlToolCalls,
+        stripToolCallRanges: xmlStripRanges,
+      } = parseXmlToolCalls(strippedContent, isHy3Model(model))
       if (xmlToolCalls.length > 0) {
-        const visibleText = stripRanges(strippedContent, toolCallRanges).trim()
+        const visibleText = stripRanges(strippedContent, xmlStripRanges).trim()
         if (visibleText) content.push({ type: 'text', text: visibleText })
         for (const toolCall of xmlToolCalls) {
           content.push({
@@ -3209,9 +3239,17 @@ async function* openaiStreamToAnthropic(
           // Must run before closeActiveContentBlock so the text buffer can be flushed
           // with tool-call JSON stripped (P2). Local models often emit tool calls as
           // raw JSON text; scan accumulated text on any terminal finish reason with no
-          // API tool calls. finish_reason is mutated to 'tool_calls' only for 'stop'
-          // so the JSON fallback remains scoped to normal completions.
-          const OLLAMA_TERMINAL_REASONS = new Set(['stop', 'length', 'content_filter', 'safety'])
+          // API tool calls. Include finish_reason "tool_calls" so servers that mark
+          // text-form tools that way (without delta.tool_calls) still recover.
+          // finish_reason is mutated to 'tool_calls' only for 'stop' so the JSON
+          // fallback remains scoped to normal completions for other reasons.
+          const OLLAMA_TERMINAL_REASONS = new Set([
+            'stop',
+            'length',
+            'content_filter',
+            'safety',
+            'tool_calls',
+          ])
           const isTerminalOllamaFinish =
             OLLAMA_TERMINAL_REASONS.has(choice.finish_reason ?? '') &&
             activeToolCalls.size === 0 &&
@@ -3240,13 +3278,38 @@ async function* openaiStreamToAnthropic(
                 accumulatedText,
                 allowHy3ToolCalls,
               )
-              if (xmlParsed.calls.length > 0) {
-                recoveredCalls = xmlParsed.calls
-                recoveredRanges = xmlParsed.toolCallRanges
+              // Drop names not in the allowlist; strip every matching block
+              // (including duplicates) via stripToolCallRanges.
+              const allow =
+                allowedToolNames instanceof Set
+                  ? allowedToolNames
+                  : allowedToolNames
+                    ? new Set(allowedToolNames)
+                    : undefined
+              const filteredCalls: typeof recoveredCalls = []
+              for (let i = 0; i < xmlParsed.calls.length; i++) {
+                const call = xmlParsed.calls[i]!
+                if (
+                  allow &&
+                  allow.size > 0 &&
+                  !allow.has(call.name)
+                ) {
+                  continue
+                }
+                filteredCalls.push(call)
+              }
+              if (filteredCalls.length > 0) {
+                recoveredCalls = filteredCalls
+                // When allowlist is active, still strip all recognized XML
+                // blocks so duplicate copies of accepted tools vanish from text.
+                recoveredRanges = xmlParsed.stripToolCallRanges
               }
             }
             if (recoveredCalls.length > 0) {
               ollamaClosedContentBlock = true
+              // Buffer is consumed via accumulatedText recovery — clear so EOF
+              // flush does not re-emit raw JSON/XML as visible text.
+              ollamaTextBuffer = ''
               // Compute visible prose (tool-call payload stripped, think-tags removed).
               // Use accumulatedText (raw) as source because ranges are relative to it.
               const stripped = stripRanges(accumulatedText, recoveredRanges).trim()
@@ -3322,6 +3385,7 @@ async function* openaiStreamToAnthropic(
                 index: contentBlockIndex,
                 delta: { type: 'text_delta', text: ollamaTextBuffer },
               }
+              ollamaTextBuffer = ''
             }
           }
 
@@ -3333,12 +3397,12 @@ async function* openaiStreamToAnthropic(
           if (!isOllamaStream && xmlToolCallText !== null) {
             const buffered = xmlToolCallText
             xmlToolCallText = null
-            const { calls, toolCallRanges } = parseXmlToolCalls(
+            const { calls, stripToolCallRanges } = parseXmlToolCalls(
               buffered,
               allowHy3ToolCalls,
             )
             if (calls.length > 0) {
-              const stripped = stripRanges(buffered, toolCallRanges).trim()
+              const stripped = stripRanges(buffered, stripToolCallRanges).trim()
               const strippedVisible = stripThinkTags(stripped).trim()
               if (strippedVisible) {
                 // emitTextDelta opens a text block if one is not already open;
@@ -3564,6 +3628,39 @@ async function* openaiStreamToAnthropic(
     )
   }
 
+  // Truncated streams may end after text deltas without finish_reason.
+  // Flush any self-hosted buffer so assistant text is not lost at message_stop.
+  if (isOllamaStream && ollamaTextBuffer) {
+    throwIfStreamAborted(signal)
+    if (!hasEmittedContentStart) {
+      yield {
+        type: 'content_block_start',
+        index: contentBlockIndex,
+        content_block: { type: 'text', text: '' },
+      }
+      hasEmittedContentStart = true
+    }
+    throwIfStreamAborted(signal)
+    yield {
+      type: 'content_block_delta',
+      index: contentBlockIndex,
+      delta: { type: 'text_delta', text: ollamaTextBuffer },
+    }
+    ollamaTextBuffer = ''
+    if (!hasProcessedFinishReason) {
+      throwIfStreamAborted(signal)
+      yield { type: 'content_block_stop', index: contentBlockIndex }
+      contentBlockIndex++
+      hasEmittedContentStart = false
+      lastStopReason = lastStopReason ?? 'end_turn'
+      throwIfStreamAborted(signal)
+      yield {
+        type: 'message_delta',
+        delta: { stop_reason: lastStopReason, stop_sequence: null },
+      }
+    }
+  }
+
   throwIfStreamAborted(signal)
   yield { type: 'message_stop' }
 }
@@ -3693,11 +3790,14 @@ class OpenAIShimMessages {
 
     const promise = (async () => {
       // A provider override is a complete route, so it must not inherit an
-      // Azure-style escape hatch intended for the parent route.
+      // Azure-style escape hatch or parent self-hosted recovery flags intended
+      // for the active profile. Evaluate recovery against this route only.
       const requestProcessEnv = self.providerOverride
         ? {
           ...process.env,
           OPENAI_AZURE_STYLE: undefined,
+          OPENAI_SELF_HOSTED_TOOLS: undefined,
+          OPENAI_PARSE_TEXT_TOOL_CALLS: undefined,
         }
         : process.env
       const request = resolveProviderRequest({
@@ -3706,12 +3806,14 @@ class OpenAIShimMessages {
         reasoningEffortOverride: self.reasoningEffort,
         processEnv: requestProcessEnv,
       })
-      // Shared stream + non-stream gate for JSON-in-text tool recovery.
-      // Ollama always; other self-hosted only when tools are advertised.
+      // JSON/XML-in-text tool recovery: only when tools are advertised and the
+      // endpoint is Ollama or other self-hosted compat. Never when tools are
+      // absent — otherwise benign {"name":...} prose becomes phantom tool_use.
+      // Use requestProcessEnv so parent profile flags do not leak into overrides.
       const enableTextToolCallFallback =
-        isLikelyOllamaEndpoint(request.baseUrl) ||
-        (Boolean(params.tools?.length) &&
-          shouldUseSelfHostedToolCompat(request.baseUrl))
+        Boolean(params.tools?.length) &&
+        (isLikelyOllamaEndpoint(request.baseUrl) ||
+          shouldUseSelfHostedToolCompat(request.baseUrl, requestProcessEnv))
       const allowedToolNames = toolNamesFromShimParams(params.tools)
       const response = await self._doRequest(request, params, options, requestProcessEnv)
       httpResponse = response
@@ -4005,6 +4107,7 @@ class OpenAIShimMessages {
       injectToolResultSemanticBoundary: shouldInjectToolResultSemanticBoundary({
         baseUrl: request.baseUrl,
         model: request.resolvedModel,
+        processEnv: requestProcessEnv,
       }),
     })
 

@@ -48,6 +48,21 @@ function makeChunks(chunks: unknown[]): string[] {
   return [...chunks.map(c => `data: ${JSON.stringify(c)}\n\n`), 'data: [DONE]\n\n']
 }
 
+/** Local mirror of stripRanges for unit assertions (not exported from shim). */
+function stripRangesForTest(
+  text: string,
+  ranges: Array<[number, number]>,
+): string {
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0])
+  let result = ''
+  let pos = 0
+  for (const [s, e] of sorted) {
+    result += text.slice(pos, s)
+    pos = e
+  }
+  return result + text.slice(pos)
+}
+
 const glmChunk = (content: string, finishReason?: string) => ({
   id: 'chatcmpl-glm',
   object: 'chat.completion.chunk',
@@ -232,6 +247,20 @@ describe('parseXmlToolCalls', () => {
     const block = '<tool_call><function=Read><parameter=file_path>a.ts</parameter></function></tool_call>'
     const { calls } = parseXmlToolCalls(block + '\n' + block)
     expect(calls).toHaveLength(1)
+  })
+
+  test('stripToolCallRanges covers every duplicate XML block (1:1 toolCallRanges stays unique)', () => {
+    // Regression: dedup must not leave a second identical <tool_call> visible.
+    const block =
+      '<tool_call><function=Bash><parameter=command>pwd</parameter></function></tool_call>'
+    const text = `${block}\n${block}\nnext`
+    const { calls, toolCallRanges, stripToolCallRanges } = parseXmlToolCalls(text)
+    expect(calls).toHaveLength(1)
+    expect(toolCallRanges).toHaveLength(1)
+    expect(stripToolCallRanges).toHaveLength(2)
+    const stripped = stripRangesForTest(text, stripToolCallRanges)
+    expect(stripped).not.toContain('<tool_call>')
+    expect(stripped).toContain('next')
   })
 
   test('truncated block (no closing tag) still parses', () => {
@@ -509,18 +538,31 @@ describe('GLM streaming — XML tool calls', () => {
 
 // Self-hosted buffering path (LAN llama-server) enables isOllamaStream-style
 // text buffering. XML recovery must still run at finish — otherwise Qwen/GLM
-// XML tool calls are flushed as plain text with end_turn.
+// XML tool calls are flushed as plain text with end_turn. Also cover
+// finish_reason tool_calls without structured delta.tool_calls.
 describe('Self-hosted streaming — XML tool calls with tools advertised', () => {
   let originalFetch: FetchType
+  let originalOpenAIApiKey: string | undefined
+  let originalOpenAIBaseUrl: string | undefined
   beforeEach(() => {
     originalFetch = globalThis.fetch
+    originalOpenAIApiKey = process.env.OPENAI_API_KEY
+    originalOpenAIBaseUrl = process.env.OPENAI_BASE_URL
     process.env.OPENAI_API_KEY = 'none'
     process.env.OPENAI_BASE_URL = 'http://192.168.1.10:8080/v1'
   })
   afterEach(() => {
     globalThis.fetch = originalFetch
-    delete process.env.OPENAI_API_KEY
-    delete process.env.OPENAI_BASE_URL
+    if (originalOpenAIApiKey === undefined) {
+      delete process.env.OPENAI_API_KEY
+    } else {
+      process.env.OPENAI_API_KEY = originalOpenAIApiKey
+    }
+    if (originalOpenAIBaseUrl === undefined) {
+      delete process.env.OPENAI_BASE_URL
+    } else {
+      process.env.OPENAI_BASE_URL = originalOpenAIBaseUrl
+    }
   })
 
   test('recovers Qwen/GLM XML tool_use from buffered self-hosted stream', async () => {
@@ -584,5 +626,166 @@ describe('Self-hosted streaming — XML tool calls with tools advertised', () =>
       .map(e => (e.delta as Record<string, string>).text)
       .join('')
     expect(text).not.toContain('<tool_call>')
+  })
+
+  test('recovers JSON text tools when finish_reason is tool_calls without delta.tool_calls', async () => {
+    const chunk = (content: string, finishReason?: string) => ({
+      id: 'chatcmpl-llama',
+      object: 'chat.completion.chunk',
+      model: 'qwen3.6:35b',
+      choices: [
+        {
+          index: 0,
+          delta: { content },
+          finish_reason: finishReason ?? null,
+        },
+      ],
+    })
+
+    globalThis.fetch = (async () =>
+      makeSseResponse(
+        makeChunks([
+          chunk('{"name":"Bash","arguments":{"command":"pwd"}}'),
+          chunk('', 'tool_calls'),
+        ]),
+      )) as unknown as FetchType
+
+    const client = createOpenAIShimClient({}) as OpenAIShimClient
+    const result = await client.beta.messages
+      .create({
+        model: 'qwen3.6:35b',
+        messages: [{ role: 'user', content: 'run pwd' }],
+        tools: [
+          {
+            name: 'Bash',
+            description: 'run shell',
+            input_schema: { type: 'object', properties: {} },
+          },
+        ],
+        max_tokens: 64,
+        stream: true,
+      })
+      .withResponse()
+
+    const events: Record<string, unknown>[] = []
+    for await (const event of result.data) events.push(event)
+
+    const starts = events.filter(
+      e =>
+        e.type === 'content_block_start' &&
+        (e.content_block as Record<string, string>)?.type === 'tool_use',
+    )
+    expect(starts).toHaveLength(1)
+    expect((starts[0].content_block as Record<string, string>).name).toBe('Bash')
+
+    const messageDelta = events.find(e => e.type === 'message_delta') as
+      | Record<string, unknown>
+      | undefined
+    expect(
+      (messageDelta?.delta as Record<string, unknown> | undefined)?.stop_reason,
+    ).toBe('tool_use')
+  })
+})
+
+describe('providerOverride does not inherit parent self-hosted recovery flags', () => {
+  let originalFetch: FetchType
+  let originalOpenAIApiKey: string | undefined
+  let originalOpenAIBaseUrl: string | undefined
+  let originalSelfHosted: string | undefined
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+    originalOpenAIApiKey = process.env.OPENAI_API_KEY
+    originalOpenAIBaseUrl = process.env.OPENAI_BASE_URL
+    originalSelfHosted = process.env.OPENAI_SELF_HOSTED_TOOLS
+    process.env.OPENAI_API_KEY = 'parent-key'
+    // Parent profile is self-hosted with recovery enabled.
+    process.env.OPENAI_BASE_URL = 'https://llama.example.com:8443/v1'
+    process.env.OPENAI_SELF_HOSTED_TOOLS = '1'
+  })
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    if (originalOpenAIApiKey === undefined) {
+      delete process.env.OPENAI_API_KEY
+    } else {
+      process.env.OPENAI_API_KEY = originalOpenAIApiKey
+    }
+    if (originalOpenAIBaseUrl === undefined) {
+      delete process.env.OPENAI_BASE_URL
+    } else {
+      process.env.OPENAI_BASE_URL = originalOpenAIBaseUrl
+    }
+    if (originalSelfHosted === undefined) {
+      delete process.env.OPENAI_SELF_HOSTED_TOOLS
+    } else {
+      process.env.OPENAI_SELF_HOSTED_TOOLS = originalSelfHosted
+    }
+  })
+
+  test('remote override leaves tool-shaped text as text (not tool_use)', async () => {
+    const chunk = (content: string, finishReason?: string) => ({
+      id: 'chatcmpl-remote',
+      object: 'chat.completion.chunk',
+      model: 'gpt-4o',
+      choices: [
+        {
+          index: 0,
+          delta: { content },
+          finish_reason: finishReason ?? null,
+        },
+      ],
+    })
+
+    globalThis.fetch = (async () =>
+      makeSseResponse(
+        makeChunks([
+          chunk(
+            'Here is an example: {"name":"Bash","arguments":{"command":"ls"}}',
+          ),
+          chunk('', 'stop'),
+        ]),
+      )) as unknown as FetchType
+
+    const client = createOpenAIShimClient({
+      providerOverride: {
+        model: 'gpt-4o',
+        baseURL: 'https://api.openai.com/v1',
+        apiKey: 'sk-override',
+      },
+    }) as OpenAIShimClient
+    const result = await client.beta.messages
+      .create({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'show an example' }],
+        tools: [
+          {
+            name: 'Bash',
+            description: 'run shell',
+            input_schema: { type: 'object', properties: {} },
+          },
+        ],
+        max_tokens: 64,
+        stream: true,
+      })
+      .withResponse()
+
+    const events: Record<string, unknown>[] = []
+    for await (const event of result.data) events.push(event)
+
+    const toolStarts = events.filter(
+      e =>
+        e.type === 'content_block_start' &&
+        (e.content_block as Record<string, string>)?.type === 'tool_use',
+    )
+    expect(toolStarts).toHaveLength(0)
+
+    const text = events
+      .filter(
+        e =>
+          e.type === 'content_block_delta' &&
+          (e.delta as Record<string, string>)?.type === 'text_delta',
+      )
+      .map(e => (e.delta as Record<string, string>).text)
+      .join('')
+    expect(text).toContain('{"name":"Bash"')
   })
 })
