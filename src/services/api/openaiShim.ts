@@ -46,6 +46,7 @@ import { isBareMode, isEnvTruthy } from '../../utils/envUtils.js'
 import {
   resolveModelReasoningControl,
   resolveOpenAIShimReasoningRequestPlan,
+  type OpenAIShimEffortLevel,
 } from '../../utils/effort.js'
 import { resolveGeminiCredential } from '../../utils/geminiAuth.js'
 import { hydrateGeminiAccessTokenFromSecureStorage } from '../../utils/geminiCredentials.js'
@@ -54,7 +55,10 @@ import {
   refreshCopilotTokenOn401,
 } from '../../utils/githubModelsCredentials.js'
 import { resolveXaiAccessToken } from '../../utils/xaiCredentials.js'
-import { resolveOpenAIShimRuntimeContext } from '../../integrations/runtimeMetadata.js'
+import {
+  resolveModelRuntimeLimits,
+  resolveOpenAIShimRuntimeContext,
+} from '../../integrations/runtimeMetadata.js'
 import {
   getRouteDescriptor,
   isLongcatBaseUrl,
@@ -3994,12 +3998,12 @@ class OpenAIShimStream {
 
 class OpenAIShimMessages {
   private defaultHeaders: Record<string, string>
-  private reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'
+  private reasoningEffort?: OpenAIShimEffortLevel
   private providerOverride?: { model: string; baseURL: string; apiKey: string }
   private credentialPool?: CredentialPool
   private credentialPoolRaw?: string
 
-  constructor(defaultHeaders: Record<string, string>, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', providerOverride?: { model: string; baseURL: string; apiKey: string }) {
+  constructor(defaultHeaders: Record<string, string>, reasoningEffort?: OpenAIShimEffortLevel, providerOverride?: { model: string; baseURL: string; apiKey: string }) {
     this.defaultHeaders = filterAnthropicHeaders(defaultHeaders)
     this.reasoningEffort = reasoningEffort
     this.providerOverride = providerOverride
@@ -4317,12 +4321,19 @@ class OpenAIShimMessages {
       message?: { role?: string; content?: unknown }
       content?: unknown
     }>
+    const runtimeModel = request.requestedModel
     const runtimeShimContext = resolveOpenAIShimRuntimeContext({
       processEnv: requestProcessEnv,
       baseUrl: request.baseUrl,
-      model: request.resolvedModel,
+      model: runtimeModel,
       treatAsLocal: isLocalProviderUrl(request.baseUrl),
       preferBaseUrlRoute: Boolean(this.providerOverride),
+    })
+    const runtimeLimits = resolveModelRuntimeLimits({
+      model: runtimeModel,
+      baseUrl: request.baseUrl,
+      processEnv: requestProcessEnv,
+      activeProfileProvider: runtimeShimContext.routeId ?? undefined,
     })
     const shimConfig = runtimeShimContext.openaiShimConfig
     // When endpointPath is overridden, the body format must match the target
@@ -4342,9 +4353,10 @@ class OpenAIShimMessages {
       rawMessages,
       () => fastPath.skipToolHistoryCompression
         ? rawMessages
-        : compressToolHistory(rawMessages, request.resolvedModel, {
+        : compressToolHistory(rawMessages, runtimeModel, {
           textBlockSeparator:
             effectiveTransport === 'chat_completions' ? '\n\n' : '\n',
+          runtimeLimits,
         }),
     )
     const useNativeOllamaChat =
@@ -4365,7 +4377,7 @@ class OpenAIShimMessages {
       }),
     )
 
-    const reasoningControl = resolveModelReasoningControl(request.resolvedModel, {
+    const reasoningControl = resolveModelReasoningControl(runtimeModel, {
       routeId: runtimeShimContext.routeId,
       useRuntimeFallback: false,
       openaiShimConfig: shimConfig,
@@ -4382,7 +4394,7 @@ class OpenAIShimMessages {
       modelRequiresResponsesApi(request.resolvedModel) &&
       baseUrlSupportsResponsesAutoRoute(request.baseUrl, requestProcessEnv)
     const reasoningRequestPlan = resolveOpenAIShimReasoningRequestPlan({
-      model: request.resolvedModel,
+      model: runtimeModel,
       requestedEffort: suppressReasoningForForcedChat ? undefined : request.reasoning?.effort,
       requestThinkingType: (params.thinking as { type?: string } | undefined)?.type,
       defaultThinkingType: request.thinking?.type,
@@ -4404,6 +4416,13 @@ class OpenAIShimMessages {
      // most OpenAI-compatible endpoints read it from this top-level field.
     if (reasoningRequestPlan.wireFormat === 'reasoning_effort' && reasoningRequestPlan.reasoningEffort) {
       body.reasoning_effort = reasoningRequestPlan.reasoningEffort
+    }
+    if (
+      reasoningRequestPlan.wireFormat === 'reasoning_effort' &&
+      reasoningRequestPlan.thinkingType === 'disabled'
+    ) {
+      body.thinking = { type: 'disabled' }
+      delete body.reasoning_effort
     }
     // Convert max_tokens to max_completion_tokens for OpenAI API compatibility.
     // Azure OpenAI requires max_completion_tokens and does not accept max_tokens.
@@ -5713,9 +5732,9 @@ class OpenAIShimMessages {
 
 class OpenAIShimBeta {
   messages: OpenAIShimMessages
-  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'
+  reasoningEffort?: OpenAIShimEffortLevel
 
-  constructor(defaultHeaders: Record<string, string>, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', providerOverride?: { model: string; baseURL: string; apiKey: string }) {
+  constructor(defaultHeaders: Record<string, string>, reasoningEffort?: OpenAIShimEffortLevel, providerOverride?: { model: string; baseURL: string; apiKey: string }) {
     this.messages = new OpenAIShimMessages(defaultHeaders, reasoningEffort, providerOverride)
     this.reasoningEffort = reasoningEffort
   }
@@ -5725,7 +5744,7 @@ export function createOpenAIShimClient(options: {
   defaultHeaders?: Record<string, string>
   maxRetries?: number
   timeout?: number
-  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'
+  reasoningEffort?: OpenAIShimEffortLevel
   providerOverride?: { model: string; baseURL: string; apiKey: string }
 }): unknown {
   hydrateGeminiAccessTokenFromSecureStorage()

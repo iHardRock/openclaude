@@ -841,6 +841,26 @@ test('Kimi Code kimi-for-coding uses provider-specific context and output caps',
   })
 })
 
+test('Kimi Code K3 1M choice uses the Allegretto cap', () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.kimi.com/coding/v1'
+  delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
+
+  expect(getContextWindowForModel('k3')).toBe(1_048_576)
+  expect(getModelMaxOutputTokens('k3')).toEqual({
+    default: 32_768,
+    upperLimit: 32_768,
+  })
+})
+
+test('Kimi Code K3 256K catalog choice uses the Moderato cap', () => {
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL = 'https://api.kimi.com/coding/v1'
+  delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS
+
+  expect(getContextWindowForModel('k3-256k')).toBe(262_144)
+})
+
 test('DashScope glm-5 uses provider-specific context and output caps', () => {
   process.env.CLAUDE_CODE_USE_OPENAI = '1'
   delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS

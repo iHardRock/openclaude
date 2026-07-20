@@ -144,10 +144,17 @@ const CODEX_ALIAS_MODELS: Record<
 } as const
 
 type CodexAlias = keyof typeof CODEX_ALIAS_MODELS
-type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh'
+type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 type ThinkingType = 'enabled' | 'disabled'
 
 const OPENAI_CODEX_SHORTCUT_ALIASES = new Set(['codexplan', 'codexspark'])
+const KIMI_K3_REASONING_ALIASES: Record<ReasoningEffort, ReasoningEffort> = {
+  low: 'low',
+  medium: 'high',
+  high: 'high',
+  xhigh: 'max',
+  max: 'max',
+}
 
 export type ProviderTransport = 'chat_completions' | 'responses' | 'responses_compat' | 'codex_responses'
 export type OpenAICompatibleApiFormat = 'chat_completions' | 'responses' | 'responses_compat'
@@ -298,6 +305,7 @@ function resolveRouteCatalogAliasApiName(options: {
     baseUrl: options.baseUrl,
     model: options.model,
     treatAsLocal: options.baseUrl ? isLocalProviderUrl(options.baseUrl) : false,
+    preferBaseUrlRoute: options.baseUrl !== undefined,
   })
   const routeId = runtimeShimContext.routeId
   if (!routeId || routeId === 'anthropic' || routeId === 'openai') {
@@ -317,7 +325,7 @@ function resolveRouteCatalogAliasApiName(options: {
 function parseReasoningEffort(value: string | undefined): ReasoningEffort | undefined {
   if (!value) return undefined
   const normalized = value.trim().toLowerCase()
-  if (normalized === 'low' || normalized === 'medium' || normalized === 'high' || normalized === 'xhigh') {
+  if (normalized === 'low' || normalized === 'medium' || normalized === 'high' || normalized === 'xhigh' || normalized === 'max') {
     return normalized
   }
   return undefined
@@ -1070,6 +1078,16 @@ export function resolveProviderRequest(options?: {
           model: resolvedModel,
           treatAsLocal: finalBaseUrl ? isLocalProviderUrl(finalBaseUrl) : false,
         })
+  const explicitBaseUrlRuntimeContext =
+    isGithubMode
+      ? null
+      : resolveOpenAIShimRuntimeContext({
+          processEnv,
+          baseUrl: finalBaseUrl,
+          model: resolvedModel,
+          treatAsLocal: finalBaseUrl ? isLocalProviderUrl(finalBaseUrl) : false,
+          preferBaseUrlRoute: true,
+        })
   const explicitApiFormat =
     isGithubMode
       ? undefined
@@ -1121,13 +1139,33 @@ export function resolveProviderRequest(options?: {
   // still flow on every transport, and the older aliases (gpt-5.4/5.5,
   // codexplan) keep the pre-5.6 legacy behavior of carrying their default
   // effort everywhere.
-  const reasoning = options?.reasoningEffortOverride
+  const requestedReasoning = options?.reasoningEffortOverride
     ? { effort: options.reasoningEffortOverride }
     : descriptor.reasoningFromAlias &&
         transport !== 'codex_responses' &&
         /^gpt-5\.6/.test(descriptor.baseModel)
       ? undefined
       : descriptor.reasoning
+  const catalogReasoningLevels =
+    explicitBaseUrlRuntimeContext?.catalogEntry?.modelDescriptorId === 'k3' &&
+    explicitBaseUrlRuntimeContext.catalogEntry.reasoning?.wireFormat === 'reasoning_effort'
+      ? explicitBaseUrlRuntimeContext.catalogEntry.reasoning.levels
+      : undefined
+  const isK3 = catalogReasoningLevels?.includes('max') &&
+    explicitBaseUrlRuntimeContext?.catalogEntry?.modelDescriptorId === 'k3'
+  const normalizedReasoning =
+    isK3 && requestedReasoning?.effort !== undefined
+      ? { effort: KIMI_K3_REASONING_ALIASES[requestedReasoning.effort] }
+      : requestedReasoning
+  const supportsMaxReasoning =
+    catalogReasoningLevels?.includes('max') === true
+  const reasoning =
+    (normalizedReasoning?.effort === 'max' && !supportsMaxReasoning) ||
+      (catalogReasoningLevels !== undefined &&
+        normalizedReasoning?.effort !== undefined &&
+        !catalogReasoningLevels.includes(normalizedReasoning.effort))
+      ? undefined
+      : normalizedReasoning
 
   return {
     transport,
