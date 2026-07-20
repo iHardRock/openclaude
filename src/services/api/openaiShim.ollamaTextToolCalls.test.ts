@@ -163,6 +163,8 @@ describe('parseTextToolCalls', () => {
   test('without advertised tools, Ollama path does not recover JSON as tool_use', async () => {
     // Gate requires tools — a normal Ollama JSON-looking answer must stay text.
     const previousFetch = globalThis.fetch
+    const originalOpenAIBaseUrl = process.env.OPENAI_BASE_URL
+    const originalOpenAIApiKey = process.env.OPENAI_API_KEY
     process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
     process.env.OPENAI_API_KEY = 'test-key'
     globalThis.fetch = (async () =>
@@ -201,8 +203,16 @@ describe('parseTextToolCalls', () => {
       expect(text).toContain('"name":"status"')
     } finally {
       globalThis.fetch = previousFetch
-      delete process.env.OPENAI_BASE_URL
-      delete process.env.OPENAI_API_KEY
+      if (originalOpenAIBaseUrl === undefined) {
+        delete process.env.OPENAI_BASE_URL
+      } else {
+        process.env.OPENAI_BASE_URL = originalOpenAIBaseUrl
+      }
+      if (originalOpenAIApiKey === undefined) {
+        delete process.env.OPENAI_API_KEY
+      } else {
+        process.env.OPENAI_API_KEY = originalOpenAIApiKey
+      }
     }
   })
 
