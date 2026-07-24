@@ -8616,6 +8616,60 @@ test('injects semantic assistant message when tool result is followed by user me
 })
 // openaiShim test extraction seam 136 end
 
+test('injects semantic boundary for Mistral models', async () => {
+  // Mistral API requires tool → assistant placeholder → user pattern with
+  // "[Tool results received]" assistant message before user content.
+  process.env.OPENAI_BASE_URL = 'https://api.mistral.ai/v1'
+  process.env.OPENAI_API_KEY = 'sk-mistral-test'
+
+  let requestBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-mistral',
+        object: 'chat.completion',
+        created: 123456789,
+        model: 'mistral-large-latest',
+        choices: [
+          { message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as unknown as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  await client.beta.messages.create({
+    model: 'mistral-large-latest',
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'call_1', name: 'Bash', input: { command: 'ls' } }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'call_1', content: 'file.txt' }],
+      },
+      { role: 'user', content: 'What is in the directory?' },
+    ],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  const messages = requestBody?.messages as Array<Record<string, unknown>>
+  const roles = messages.map(m => m.role)
+  // Mistral path should inject assistant placeholder between tool_result and user
+  expect(roles).toEqual(['assistant', 'tool', 'assistant', 'user'])
+  const assistantPlaceholder = messages.find(
+    m => m.role === 'assistant' && m.content === '[Tool results received]',
+  )
+  expect(assistantPlaceholder).toBeDefined()
+})
+
 test('does not inject semantic boundary for llama-server / non-Mistral models', async () => {
   // llama-server + Qwen (or any non-Mistral OpenAI-compat): tool → user must
   // stay intact. Injecting "[Tool results received]" makes the model echo it

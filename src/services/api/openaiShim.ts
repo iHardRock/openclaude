@@ -1543,6 +1543,20 @@ function nextTextToolCallSequence(): number {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers for text tool call parsing
+// ---------------------------------------------------------------------------
+
+/** Normalize allowedToolNames to a Set or undefined. */
+function normalizeAllowedToolNames(
+  allowedToolNames?: ReadonlySet<string> | readonly string[],
+): ReadonlySet<string> | undefined {
+  if (!allowedToolNames) return undefined
+  return allowedToolNames instanceof Set
+    ? allowedToolNames
+    : new Set(allowedToolNames)
+}
+
+// ---------------------------------------------------------------------------
 // XML tool call parser (GLM / Qwen / DeepSeek family)
 //
 // Several models routed through OpenAI-compatible gateways emit tool calls as
@@ -2873,53 +2887,51 @@ async function* openaiStreamToAnthropic(
                 allowHy3ToolCalls,
               )
               // Drop names not in the allowlist; strip only blocks for accepted calls.
-              const allow =
-                allowedToolNames instanceof Set
-                  ? allowedToolNames
-                  : allowedToolNames
-                    ? new Set(allowedToolNames)
-                    : undefined
-              const filteredCalls: typeof recoveredCalls = []
-              const filteredStripRanges: typeof xmlParsed.stripToolCallRanges = []
-              const usedStripRangeIndices = new Set<number>()
+              const allow = normalizeAllowedToolNames(allowedToolNames)
 
-              // Map each unique call to its first occurrence range in stripToolCallRanges.
+              // Build a set of unique call indices that pass the allowlist.
+              const acceptedCallIndices = new Set<number>()
               for (let i = 0; i < xmlParsed.calls.length; i++) {
                 const call = xmlParsed.calls[i]!
-                if (
-                  allow &&
-                  allow.size > 0 &&
-                  !allow.has(call.name)
-                ) {
+                if (allow && allow.size > 0 && !allow.has(call.name)) {
                   continue
                 }
-                filteredCalls.push(call)
-
-                // Find the first stripToolCallRanges entry that matches this call's range.
-                // toolCallRanges[i] is the canonical range for this unique call; find the
-                // closest matching entry in stripToolCallRanges that hasn't been used yet.
-                const canonicalRange = xmlParsed.toolCallRanges[i]!
-                let matchedIdx = xmlParsed.stripToolCallRanges.findIndex(
-                  (r, idx) =>
-                    !usedStripRangeIndices.has(idx) &&
-                    r[0] === canonicalRange[0] &&
-                    r[1] === canonicalRange[1],
-                )
-                if (matchedIdx === -1) {
-                  // Fallback: find any range that contains the same call name at same position.
-                  matchedIdx = xmlParsed.stripToolCallRanges.findIndex(
-                    (r, idx) =>
-                      !usedStripRangeIndices.has(idx) &&
-                      r[0] === canonicalRange[0],
-                  )
-                }
-                if (matchedIdx !== -1) {
-                  usedStripRangeIndices.add(matchedIdx)
-                  filteredStripRanges.push(xmlParsed.stripToolCallRanges[matchedIdx]!)
-                }
+                acceptedCallIndices.add(i)
               }
 
-              if (filteredCalls.length > 0) {
+              if (acceptedCallIndices.size > 0) {
+                // Include only accepted unique calls.
+                const filteredCalls: typeof recoveredCalls = []
+                for (let i = 0; i < xmlParsed.calls.length; i++) {
+                  if (acceptedCallIndices.has(i)) {
+                    filteredCalls.push(xmlParsed.calls[i]!)
+                  }
+                }
+
+                // Include all stripToolCallRanges entries whose corresponding unique call
+                // is accepted. We map each strip range to its owning unique call index
+                // by comparing block content at that position.
+                const filteredStripRanges: typeof xmlParsed.stripToolCallRanges = []
+
+                for (const stripRange of xmlParsed.stripToolCallRanges) {
+                  const stripContent = accumulatedText.slice(stripRange[0], stripRange[1])
+                  let ownedByUniqueIdx: number | null = null
+                  for (let j = 0; j < xmlParsed.toolCallRanges.length; j++) {
+                    if (!acceptedCallIndices.has(j)) continue
+                    const toolContent = accumulatedText.slice(
+                      xmlParsed.toolCallRanges[j][0],
+                      xmlParsed.toolCallRanges[j][1],
+                    )
+                    if (stripContent === toolContent) {
+                      ownedByUniqueIdx = j
+                      break
+                    }
+                  }
+                  if (ownedByUniqueIdx !== null) {
+                    filteredStripRanges.push(stripRange)
+                  }
+                }
+
                 recoveredCalls = filteredCalls
                 recoveredRanges = filteredStripRanges
               }

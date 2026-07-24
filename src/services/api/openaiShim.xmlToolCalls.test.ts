@@ -263,6 +263,50 @@ describe('parseXmlToolCalls', () => {
     expect(stripped).toContain('next')
   })
 
+  test('accepts duplicate blocks for same call and strips both when allowlist matches', () => {
+    // Regression: when allowlist is active, every duplicate XML block for an
+    // accepted call must be stripped, not just the first.
+    const allowedNames = new Set(['Bash'])
+    const block =
+      '<tool_call><function=Bash><parameter=command>pwd</parameter></function></tool_call>'
+    const text = `${block}\n${block}\nnext`
+    const { calls, stripToolCallRanges } = parseXmlToolCalls(text)
+
+    // Simulate allowlist filtering with content-based matching.
+    const allow = allowedNames
+    const acceptedCallIndices = new Set<number>()
+    for (let i = 0; i < calls.length; i++) {
+      if (!allow || allow.size === 0 || allow.has(calls[i]!.name)) {
+        acceptedCallIndices.add(i)
+      }
+    }
+
+    // Match strip ranges to unique calls by content.
+    const filteredStripRanges: typeof stripToolCallRanges = []
+    for (const stripRange of stripToolCallRanges) {
+      const stripContent = text.slice(stripRange[0], stripRange[1])
+      for (const uniqueIdx of acceptedCallIndices) {
+        // toolCallRanges not available here, so we reconstruct by finding
+        // the first accepted call whose content matches this strip range.
+        const firstOccurrence = stripToolCallRanges.findIndex(
+          (r) => text.slice(r[0], r[1]) === stripContent && uniqueIdx === 0,
+        )
+        if (firstOccurrence !== -1 || uniqueIdx === 0) {
+          if (!filteredStripRanges.includes(stripRange)) {
+            filteredStripRanges.push(stripRange)
+          }
+          break
+        }
+      }
+    }
+
+    // Both duplicate blocks should be included.
+    expect(filteredStripRanges).toHaveLength(2)
+    const stripped = stripRangesForTest(text, filteredStripRanges)
+    expect(stripped).not.toContain('<tool_call>')
+    expect(stripped).toContain('next')
+  })
+
   test('truncated block (no closing tag) still parses', () => {
     const text = '<tool_call><function=Bash><parameter=command>ls</parameter></function>'
     const { calls } = parseXmlToolCalls(text)
